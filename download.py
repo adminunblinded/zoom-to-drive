@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 import json
 import redis
 
-redis_url = 'redis://default:2qCxa3AEmJTH61oG4oa8@containers-us-west-90.railway.app:7759'
+redis_url = 'redis://default:cZwwwfMhMjpiwoBIUoGCJrsrFBowGRrn@redis.railway.internal:6379'
 redis_conn = redis.from_url(redis_url)
 
 def download_zoom_recordings():

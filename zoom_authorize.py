@@ -11,10 +11,10 @@ zoom_blueprint.secret_key = '@unblinded2018'
 
 client_id = 'N_IGn4DWQfuuklf8NDQA'
 client_secret = '5IhTwYBVhqmpDKhIF1PUzEqHd9OMtiHD'
-redirect_uri = 'https://flask-production-d5a3.up.railway.app/authorize'
+redirect_uri = 'https://flask-production-0cd3.up.railway.app/authorize'
 
 # Establish Redis connection
-redis_url = 'redis://default:2qCxa3AEmJTH61oG4oa8@containers-us-west-90.railway.app:7759'
+redis_url = 'redis://default:cZwwwfMhMjpiwoBIUoGCJrsrFBowGRrn@redis.railway.internal:6379'
 redis_conn = redis.from_url(redis_url)
 
 # Function to refresh the access token

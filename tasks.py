@@ -13,8 +13,8 @@ from google.oauth2 import credentials as google_credentials
 from requests.exceptions import ConnectionError, ChunkedEncodingError
 
 # Create a Celery instance
-celery = Celery('task', broker='redis://default:2qCxa3AEmJTH61oG4oa8@containers-us-west-90.railway.app:7759')
-redis_client = redis.from_url("redis://default:2qCxa3AEmJTH61oG4oa8@containers-us-west-90.railway.app:7759")
+celery = Celery('task', broker='redis://default:cZwwwfMhMjpiwoBIUoGCJrsrFBowGRrn@redis.railway.internal:6379')
+redis_client = redis.from_url("redis://default:cZwwwfMhMjpiwoBIUoGCJrsrFBowGRrn@redis.railway.internal:6379")
 
 
 @celery.task(bind=True, max_retries=3)
