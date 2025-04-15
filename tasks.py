@@ -13,48 +13,43 @@ from google.oauth2 import credentials as google_credentials
 from requests.exceptions import ConnectionError, ChunkedEncodingError
 import importlib.metadata
 
-# Monkey patch for EntryPoints compatibility issue in Python 3.12
-def patch_entry_points():
+# More comprehensive monkey patch for EntryPoints issue in Python 3.12 with Celery
+def patch_celery_entry_points():
     try:
-        import pkg_resources
-        if not hasattr(importlib.metadata.EntryPoints, 'get'):
-            old_entry_points = importlib.metadata.entry_points
-
-            def entry_points_with_get():
-                eps = old_entry_points()
-                if hasattr(eps, '_from_text_for'):  # python >= 3.10
-                    return _PatchedEntryPoints(eps)
-                return eps  # older python versions
-
-            class _PatchedEntryPoints:
-                def __init__(self, entry_points):
-                    self._entry_points = entry_points
+        # Direct patch for celery.utils.imports.load_extension_class_names
+        from celery.utils import imports
+        original_load_extension = imports.load_extension_class_names
+        
+        def patched_load_extension_class_names(namespace):
+            try:
+                eps = importlib.metadata.entry_points()
+                result = {}
+                # Filter entry points for the requested namespace
+                for ep in eps:
+                    if ep.group == namespace:
+                        result[ep.name] = ep.value
+                return result
+            except Exception as e:
+                print(f"EntryPoints patch error: {e}")
+                return {}
                 
-                def __iter__(self):
-                    return iter(self._entry_points)
-                
-                def get(self, group, name=None):
-                    if name is None:
-                        return [ep for ep in self._entry_points if ep.group == group]
-                    return next((ep for ep in self._entry_points if ep.group == group and ep.name == name), None)
-                
-                def select(self, **kwargs):
-                    return self._entry_points.select(**kwargs)
-            
-            importlib.metadata.entry_points = entry_points_with_get
-    except (ImportError, AttributeError):
-        pass
+        # Replace the original function with our patched version
+        imports.load_extension_class_names = patched_load_extension_class_names
+        
+    except (ImportError, AttributeError) as e:
+        print(f"Failed to apply EntryPoints patch: {e}")
 
 # Apply the patch before Celery is initialized
-patch_entry_points()
+patch_celery_entry_points()
 
 redis_url = 'redis://default:cZwwwfMhMjpiwoBIUoGCJrsrFBowGRrn@redis.railway.internal:6379'
 
-# Initialize Celery with explicit broker and backend configuration
+# Initialize Celery with explicit broker and no backend
 celery = Celery('tasks')
 celery.conf.update(
     broker_url=redis_url,
-    result_backend=redis_url,
+    # Explicitly disable result backend
+    result_backend=None,
     broker_connection_retry=True,
     broker_connection_retry_on_startup=True,
     broker_connection_timeout=30,
@@ -62,8 +57,10 @@ celery.conf.update(
     task_serializer='pickle',
     result_serializer='pickle',
     worker_proc_alive_timeout=60.0,
-    task_ignore_result=False,
-    task_track_started=True,
+    # Explicitly disable result tracking
+    task_ignore_result=True,
+    task_store_errors_even_if_ignored=False,
+    task_track_started=False,
     task_time_limit=3600,
     worker_hijack_root_logger=False
 )
@@ -72,7 +69,19 @@ redis_client = redis.from_url(redis_url)
 
 
 @celery.task(bind=True, max_retries=3)
-def uploadFiles(self, serialized_credentials, recordings):
+def uploadFiles(self_or_serialized_credentials=None, recordings_or_self=None, recordings=None):
+    """
+    This function is designed to work both as a Celery task and as a direct function call
+    """
+    # Handle both direct calls and Celery task calls
+    if recordings is None:
+        # Direct function call - first arg is credentials, second is recordings
+        serialized_credentials = self_or_serialized_credentials
+        recordings = recordings_or_self
+    else:
+        # Celery task call - first arg is self, second is credentials, third is recordings
+        serialized_credentials = recordings_or_self
+    
     try:
         credentials = pickle.loads(serialized_credentials)
         API_VERSION = 'v3'
