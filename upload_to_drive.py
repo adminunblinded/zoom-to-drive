@@ -59,9 +59,15 @@ def index():
         recordings = download_zoom_recordings()
 
         serialized_credentials = redis_client.get('credentials')
-        uploadFiles.delay(serialized_credentials, recordings)
         
-        return "Recordings are being uploaded"
+        try:
+            # Call the task directly with apply_async instead of delay
+            task = uploadFiles.apply_async(args=[serialized_credentials, recordings], ignore_result=True)
+            return "Recordings are being uploaded"
+        except Exception as e:
+            # Log the exception and return an error message
+            print(f"Error starting upload task: {str(e)}")
+            return f"Error starting upload: {str(e)}"
     else:
         authorization_url, state = flow.authorization_url(
             access_type='offline',
@@ -117,8 +123,13 @@ def upload_callback():
         serialized_credentials = pickle.dumps(credentials)
         redis_client.set('credentials', serialized_credentials)
 
-        uploadFiles.delay(serialized_credentials, recordings)
-        
-        return "Recordings are being uploaded"
+        try:
+            # Call the task directly with apply_async instead of delay
+            task = uploadFiles.apply_async(args=[serialized_credentials, recordings], ignore_result=True)
+            return "Recordings are being uploaded"
+        except Exception as e:
+            # Log the exception and return an error message
+            print(f"Error starting upload task: {str(e)}")
+            return f"Error starting upload: {str(e)}"
     else:
         return "Failed to refresh access token"

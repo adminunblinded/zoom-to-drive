@@ -11,18 +11,61 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from google.oauth2 import credentials as google_credentials
 from requests.exceptions import ConnectionError, ChunkedEncodingError
+import importlib.metadata
+
+# Monkey patch for EntryPoints compatibility issue in Python 3.12
+def patch_entry_points():
+    try:
+        import pkg_resources
+        if not hasattr(importlib.metadata.EntryPoints, 'get'):
+            old_entry_points = importlib.metadata.entry_points
+
+            def entry_points_with_get():
+                eps = old_entry_points()
+                if hasattr(eps, '_from_text_for'):  # python >= 3.10
+                    return _PatchedEntryPoints(eps)
+                return eps  # older python versions
+
+            class _PatchedEntryPoints:
+                def __init__(self, entry_points):
+                    self._entry_points = entry_points
+                
+                def __iter__(self):
+                    return iter(self._entry_points)
+                
+                def get(self, group, name=None):
+                    if name is None:
+                        return [ep for ep in self._entry_points if ep.group == group]
+                    return next((ep for ep in self._entry_points if ep.group == group and ep.name == name), None)
+                
+                def select(self, **kwargs):
+                    return self._entry_points.select(**kwargs)
+            
+            importlib.metadata.entry_points = entry_points_with_get
+    except (ImportError, AttributeError):
+        pass
+
+# Apply the patch before Celery is initialized
+patch_entry_points()
 
 redis_url = 'redis://default:cZwwwfMhMjpiwoBIUoGCJrsrFBowGRrn@redis.railway.internal:6379'
-celery = Celery('task', 
-                broker=redis_url,
-                backend=redis_url)
 
-# Fix for EntryPoints compatibility issue
+# Initialize Celery with explicit broker and backend configuration
+celery = Celery('tasks')
 celery.conf.update(
+    broker_url=redis_url,
+    result_backend=redis_url,
+    broker_connection_retry=True,
+    broker_connection_retry_on_startup=True,
+    broker_connection_timeout=30,
     accept_content=['pickle', 'json'],
     task_serializer='pickle',
     result_serializer='pickle',
-    worker_proc_alive_timeout=60.0
+    worker_proc_alive_timeout=60.0,
+    task_ignore_result=False,
+    task_track_started=True,
+    task_time_limit=3600,
+    worker_hijack_root_logger=False
 )
 
 redis_client = redis.from_url(redis_url)
