@@ -68,12 +68,24 @@ def index():
             include_granted_scopes='true',
             prompt='consent'
         )
+        # Store the state in Redis
+        redis_client.set('oauth_state', state)
         return redirect(authorization_url)
 
 @upload_blueprint.route('/upload_callback')
 def upload_callback():
-    authorization_code = request.args.get('code')
-    flow.fetch_token(authorization_response=request.url)
+    # Retrieve the stored state from Redis
+    stored_state = redis_client.get('oauth_state')
+    if stored_state:
+        stored_state = stored_state.decode('utf-8')
+        # Pass the state to fetch_token
+        flow.fetch_token(
+            authorization_response=request.url,
+            state=stored_state
+        )
+    else:
+        # Handle the case where state is missing
+        return "Authorization failed: OAuth state parameter missing"
 
     # Refresh the access token
     credentials = flow.credentials

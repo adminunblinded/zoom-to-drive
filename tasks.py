@@ -12,8 +12,20 @@ from googleapiclient.http import MediaIoBaseUpload
 from google.oauth2 import credentials as google_credentials
 from requests.exceptions import ConnectionError, ChunkedEncodingError
 
-celery = Celery('task', broker='redis://default:cZwwwfMhMjpiwoBIUoGCJrsrFBowGRrn@redis.railway.internal:6379')
-redis_client = redis.from_url("redis://default:cZwwwfMhMjpiwoBIUoGCJrsrFBowGRrn@redis.railway.internal:6379")
+redis_url = 'redis://default:cZwwwfMhMjpiwoBIUoGCJrsrFBowGRrn@redis.railway.internal:6379'
+celery = Celery('task', 
+                broker=redis_url,
+                backend=redis_url)
+
+# Fix for EntryPoints compatibility issue
+celery.conf.update(
+    accept_content=['pickle', 'json'],
+    task_serializer='pickle',
+    result_serializer='pickle',
+    worker_proc_alive_timeout=60.0
+)
+
+redis_client = redis.from_url(redis_url)
 
 
 @celery.task(bind=True, max_retries=3)
