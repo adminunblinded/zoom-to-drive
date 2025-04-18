@@ -54,7 +54,7 @@ def download_zoom_recordings():
     eastern_tz = pytz.timezone('US/Eastern')
     
     end_date = datetime.now(eastern_tz)
-    start_date = end_date - timedelta(days=180)  # Fetch recordings from the past 6 months
+    start_date = end_date - timedelta(days=2)  # Fetch recordings from the past 6 months
     
     all_recordings = []
     current_date = end_date
