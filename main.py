@@ -4,6 +4,7 @@ import redis
 import json
 import logging
 import os
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(
@@ -88,3 +89,71 @@ def test():
             return jsonify(share_url)
         except Exception as e:
             return jsonify({"error": str(e)})
+
+@app.route('/debug')
+def debug_info():
+    """Debug route to check system status and connections"""
+    try:
+        # Check Redis connection
+        redis_status = "OK" if redis_client.ping() else "Failed"
+        
+        # Get Google auth status
+        google_access_token = redis_client.get('google_access_token')
+        google_refresh_token = redis_client.get('google_refresh_token')
+        google_auth_status = {
+            "has_access_token": google_access_token is not None,
+            "has_refresh_token": google_refresh_token is not None
+        }
+        
+        # Get Zoom auth status
+        zoom_token = redis_client.get('access_token')
+        zoom_auth_status = {
+            "has_token": zoom_token is not None
+        }
+        
+        # Get recent task statuses
+        task_keys = redis_client.keys('task:*')
+        tasks = []
+        for key in task_keys[:20]:  # Limit to 20 most recent tasks
+            task_data = redis_client.get(key)
+            if task_data:
+                try:
+                    task_info = json.loads(task_data)
+                    task_info['key'] = key.decode('utf-8')
+                    tasks.append(task_info)
+                except:
+                    tasks.append({"key": key.decode('utf-8'), "error": "Failed to parse task data"})
+        
+        # Get system info
+        system_info = {
+            "environment": os.environ.get('ENVIRONMENT', 'production'),
+            "python_version": os.sys.version,
+            "app_startup_time": os.environ.get('APP_STARTUP_TIME', 'unknown')
+        }
+        
+        # Try to import Celery and get info
+        try:
+            from tasks import celery
+            celery_status = {
+                "broker": celery.conf.broker_url,
+                "backend": celery.conf.result_backend,
+                "active": True
+            }
+        except Exception as e:
+            celery_status = {
+                "error": str(e),
+                "active": False
+            }
+        
+        return jsonify({
+            "timestamp": datetime.now().isoformat(),
+            "redis_status": redis_status,
+            "google_auth": google_auth_status,
+            "zoom_auth": zoom_auth_status,
+            "celery": celery_status,
+            "system": system_info,
+            "recent_tasks": tasks
+        })
+    except Exception as e:
+        logger.error(f"Error in debug endpoint: {str(e)}", exc_info=True)
+        return jsonify({"error": str(e)})

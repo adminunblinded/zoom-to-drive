@@ -117,6 +117,13 @@ celery.conf.update(
 def task_failure_handler(task_id, exception, traceback, *args, **kwargs):
     logger.error(f"Task {task_id} failed: {exception}")
     
+    # Update task status in Redis
+    try:
+        redis_client = redis.from_url(redis_url, socket_timeout=10)
+        redis_client.set(f"task_error:{task_id}", f"Error: {str(exception)}")
+    except Exception as e:
+        logger.error(f"Error updating task failure status: {str(e)}")
+    
 @signals.task_success.connect
 def task_success_handler(sender=None, **kwargs):
     logger.info(f"Task {sender.request.id} completed successfully")
@@ -124,6 +131,14 @@ def task_success_handler(sender=None, **kwargs):
 @signals.worker_ready.connect
 def worker_ready_handler(**kwargs):
     logger.info("Worker is ready to receive tasks")
+    
+    # Debug info about Celery configuration
+    try:
+        from celery import current_app
+        logger.info(f"Celery broker URL: {current_app.conf.broker_url}")
+        logger.info(f"Celery result backend: {current_app.conf.result_backend}")
+    except Exception as e:
+        logger.error(f"Error getting Celery debug info: {str(e)}")
 
 redis_client = redis.from_url(redis_url, socket_timeout=10)
 
@@ -140,8 +155,30 @@ def setup_folders(self, serialized_credentials, recordings):
     logger.info(f"Starting setup_folders task {task_id} with {len(recordings)} recordings")
     
     try:
+        # Update task status
+        update_task_status(task_id, "PROCESSING_FOLDERS", f"Setting up folders for {len(recordings)} recordings")
+        
         credentials = pickle.loads(serialized_credentials)
         API_VERSION = 'v3'
+        
+        # Verify credentials are valid and not expired
+        if not credentials or not credentials.valid:
+            logger.error(f"Invalid or expired credentials in setup_folders task {task_id}")
+            update_task_status(task_id, "ERROR", "Invalid or expired credentials")
+            return "Error: Invalid credentials"
+            
+        # Test token by making a small API call
+        try:
+            test_service = build('drive', API_VERSION, credentials=credentials, cache_discovery=False)
+            test_about = test_service.about().get(fields="user").execute()
+            user_email = test_about.get("user", {}).get("emailAddress")
+            logger.info(f"Successfully connected to Google Drive as {user_email}")
+        except Exception as e:
+            logger.error(f"Failed to connect to Google Drive API: {str(e)}")
+            update_task_status(task_id, "ERROR", f"Failed to connect to Google Drive: {str(e)}")
+            if hasattr(e, 'error_details'):
+                logger.error(f"Error details: {e.error_details}")
+            return f"Error connecting to Google Drive: {str(e)}"
         
         # Build drive service with timeout settings
         drive_service = build(
@@ -244,7 +281,11 @@ def setup_folders(self, serialized_credentials, recordings):
         redis_client.set("folder_ids", json.dumps(folder_ids))
         logger.info(f"Saved {len(folder_ids)} folder IDs to Redis")
         
+        # Update task status after folder creation
+        update_task_status(task_id, "FOLDERS_CREATED", f"Created/found {len(folder_ids)} folders")
+
         # Queue recording uploads with staggered delays
+        queued_count = 0
         for i, recording in enumerate(recordings):
             # Use countdown to stagger the tasks
             delay = i * 5 % 300  # Spread tasks over a 5-minute window
@@ -253,12 +294,18 @@ def setup_folders(self, serialized_credentials, recordings):
                 countdown=delay,
                 queue='upload'
             )
+            queued_count += 1
             
-        logger.info(f"Queued {len(recordings)} upload_recording tasks")
-        return f"Setup complete - {len(recordings)} recordings queued for processing"
+        logger.info(f"Queued {queued_count} upload_recording tasks")
+        
+        # Final task status update
+        update_task_status(task_id, "UPLOADS_QUEUED", f"Queued {queued_count} recordings for upload")
+        return f"Setup complete - {queued_count} recordings queued for processing"
             
     except Exception as e:
         logger.error(f"Error in setup_folders task: {str(e)}", exc_info=True)
+        # Update task status
+        update_task_status(task_id, "ERROR", f"Error setting up folders: {str(e)}")
         # Use exponential backoff for retries
         retry_delay = 30 * (2 ** self.request.retries)
         raise self.retry(exc=e, countdown=retry_delay, max_retries=5)
@@ -274,10 +321,26 @@ def setup_folders(self, serialized_credentials, recordings):
 def upload_recording(self, serialized_credentials, recording, recordings_folder_id):
     task_id = self.request.id
     recording_topic = recording.get('topic', 'Unknown')
-    logger.info(f"Starting upload_recording task {task_id} for '{recording_topic}'")
+    recording_id = recording.get('uuid', 'Unknown')
+    
+    logger.info(f"Starting upload_recording task {task_id} for '{recording_topic}' (ID: {recording_id})")
     
     try:
+        # Update task status
+        update_task_status(
+            task_id, 
+            "PROCESSING_RECORDING", 
+            f"Processing recording: {recording_topic}"
+        )
+        
         credentials = pickle.loads(serialized_credentials)
+        
+        # Verify credentials are valid
+        if not credentials or not credentials.valid:
+            logger.error(f"Invalid or expired credentials in upload_recording task {task_id}")
+            update_task_status(task_id, "ERROR", "Invalid or expired credentials")
+            return "Error: Invalid credentials"
+        
         API_VERSION = 'v3'
         drive_service = build('drive', API_VERSION, credentials=credentials, cache_discovery=False)
         
@@ -322,9 +385,24 @@ def upload_recording(self, serialized_credentials, recording, recordings_folder_
             if f['status'] == 'completed' and f['file_extension'] == 'MP4' and recording['duration'] >= 10
         ]
         
+        if not valid_files:
+            logger.warning(f"No valid files found for recording '{recording_topic}'")
+            update_task_status(
+                task_id, 
+                "COMPLETED", 
+                f"No valid files found for recording: {recording_topic}"
+            )
+            return f"No valid files found for recording: {recording_topic}"
+        
         logger.info(f"Processing {len(valid_files)} valid files for recording '{recording_topic}'")
+        update_task_status(
+            task_id, 
+            "QUEUING_FILES", 
+            f"Queuing {len(valid_files)} files for recording: {recording_topic}"
+        )
                 
         # Process each file in the recording
+        queued_files = 0
         for i, file_data in enumerate(recording['recording_files']):
             if (file_data['status'] == 'completed' and 
                 file_data['file_extension'] == 'MP4' and 
@@ -336,11 +414,22 @@ def upload_recording(self, serialized_credentials, recording, recordings_folder_
                     countdown=i * 10,  # 10-second delay between files
                     queue='process'
                 )
+                queued_files += 1
         
-        return f"Queued {len(valid_files)} files for processing from recording '{recording_topic}'"
+        update_task_status(
+            task_id, 
+            "COMPLETED", 
+            f"Queued {queued_files} files for upload from recording '{recording_topic}'"
+        )
+        return f"Queued {queued_files} files for processing from recording '{recording_topic}'"
             
     except Exception as e:
         logger.error(f"Error processing recording '{recording_topic}': {str(e)}")
+        update_task_status(
+            task_id, 
+            "ERROR", 
+            f"Error processing recording '{recording_topic}': {str(e)}"
+        )
         retry_delay = 60 * (2 ** self.request.retries)
         raise self.retry(exc=e, countdown=retry_delay)
 
@@ -376,12 +465,35 @@ def process_file(self, serialized_credentials, recording, file_data, folder_id):
     logger.info(f"Starting process_file task {task_id} for file {file_id} from '{topics}'")
     
     try:
+        # Update task status
+        update_task_status(
+            task_id, 
+            "PROCESSING_FILE", 
+            f"Processing file {file_id} from recording '{topics}'"
+        )
+        
         # Skip non-video files or short recordings
         if file_data['status'] != 'completed' or file_data['file_extension'] != 'MP4' or recording['duration'] < 10:
             logger.info(f"Skipping file {file_id} - not a completed MP4 or too short")
+            update_task_status(
+                task_id, 
+                "SKIPPED", 
+                f"Skipped file {file_id} - not a valid video file"
+            )
             return "Skipped - not a valid video file"
             
         credentials = pickle.loads(serialized_credentials)
+        
+        # Verify credentials are valid
+        if not credentials or not credentials.valid:
+            logger.error(f"Invalid or expired credentials in process_file task {task_id}")
+            update_task_status(
+                task_id, 
+                "ERROR", 
+                "Invalid or expired credentials"
+            )
+            return "Error: Invalid credentials"
+        
         API_VERSION = 'v3'
         drive_service = build('drive', API_VERSION, credentials=credentials, cache_discovery=False)
         
@@ -402,19 +514,43 @@ def process_file(self, serialized_credentials, recording, file_data, folder_id):
 
         if len(existing_files['files']) > 0:
             logger.info(f"Skipping upload of '{video_filename}' as it already exists in Drive")
+            update_task_status(
+                task_id, 
+                "SKIPPED_EXISTS", 
+                f"Skipped - file already exists: {video_filename}"
+            )
             return f"Skipped - file already exists: {video_filename}"
+        
+        # Update status to downloading    
+        update_task_status(
+            task_id, 
+            "DOWNLOADING", 
+            f"Downloading file: {video_filename}"
+        )
             
         # Download and upload with enhanced error handling
-        result = download_and_upload_file(self, drive_service, download_url, video_filename, folder_id)
+        result = download_and_upload_file(self, drive_service, download_url, video_filename, folder_id, task_id)
         logger.info(f"Successfully processed file {file_id}: {result}")
+        
+        # Update final status
+        update_task_status(
+            task_id, 
+            "COMPLETED", 
+            f"Successfully uploaded: {video_filename}"
+        )
         return result
             
     except Exception as e:
         logger.error(f"Error processing file {file_id}: {str(e)}", exc_info=True)
+        update_task_status(
+            task_id, 
+            "ERROR", 
+            f"Error processing file {file_id}: {str(e)}"
+        )
         retry_delay = 60 * (2 ** self.request.retries)
         raise self.retry(exc=e, countdown=retry_delay)
 
-def download_and_upload_file(task, drive_service, download_url, video_filename, folder_id):
+def download_and_upload_file(task, drive_service, download_url, video_filename, folder_id, task_id=None):
     """Download and upload a file with enhanced error handling and monitoring"""
     chunk_size = 1024 * 1024  # 1MB chunks
     
@@ -422,6 +558,14 @@ def download_and_upload_file(task, drive_service, download_url, video_filename, 
     try:
         logger.info(f"Starting download of {video_filename}")
         start_time = time.time()
+        
+        # Update task status if task_id is provided
+        if task_id:
+            update_task_status(
+                task_id, 
+                "DOWNLOADING", 
+                f"Downloading file: {video_filename}"
+            )
         
         # Download file with retry
         response = download_with_retry(download_url)
@@ -453,6 +597,14 @@ def download_and_upload_file(task, drive_service, download_url, video_filename, 
         # Reset file pointer for upload
         video_content.seek(0)
         
+        # Update task status to uploading
+        if task_id:
+            update_task_status(
+                task_id, 
+                "UPLOADING", 
+                f"Uploading file to Google Drive: {video_filename}"
+            )
+        
         # Upload to Google Drive with resumable upload
         file_metadata = {
             'name': video_filename,
@@ -468,7 +620,7 @@ def download_and_upload_file(task, drive_service, download_url, video_filename, 
         )
         
         # Create the upload request
-        logger.info(f"Starting upload of {video_filename} to Google Drive folder ID: {folder_id}")
+        logger.info(f"Starting upload of {video_filename} to Google Drive")
         upload_start_time = time.time()
         
         request = drive_service.files().create(
@@ -478,43 +630,54 @@ def download_and_upload_file(task, drive_service, download_url, video_filename, 
         )
         
         # Process the upload in chunks with exponential backoff for errors
-        upload_response = None # Renamed from response to avoid conflict with download response
-        backoff_interval = 1 # Renamed from backoff
+        response = None
+        backoff = 1
         retries = 0
         max_retries = 10
         
-        while upload_response is None and retries < max_retries:
+        while response is None and retries < max_retries:
             try:
-                status, upload_response = request.next_chunk()
+                status, response = request.next_chunk()
                 if status:
                     progress = int(status.progress() * 100)
-                    # Log progress less frequently
-                    if progress == 0 or progress == 50 or progress == 100:
-                        logger.info(f"Upload progress for {video_filename}: {progress}%")
+                    # Only log every 20% for large files
+                    if progress % 20 == 0:
+                        logger.info(f"Uploaded {progress}% of {video_filename}")
                         
             except Exception as e:
                 retries += 1
                 if retries >= max_retries:
-                    logger.error(f"Failed to upload {video_filename} after {max_retries} retries: {str(e)}")
                     raise Exception(f"Failed to upload {video_filename} after {max_retries} retries: {str(e)}")
                 
-                logger.warning(f"Upload error for {video_filename}, attempt {retries}/{max_retries}, retrying in {backoff_interval}s: {str(e)}")
-                time.sleep(backoff_interval)
-                backoff_interval = min(backoff_interval * 2, 60)  # Cap backoff at 60 seconds
+                logger.warning(f"Upload error, attempt {retries}/{max_retries}, retrying in {backoff}s: {str(e)}")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)  # Cap backoff at 60 seconds
         
         upload_time = time.time() - upload_start_time
+        file_id = response.get('id', 'unknown')
         
-        if upload_response:
-            file_id = upload_response.get('id', 'unknown')
-            logger.info(f"[UPLOAD SUCCESS] Successfully uploaded {video_filename} to Google Drive in {upload_time:.2f}s, file ID: {file_id}")
-            return f"Success: {video_filename} uploaded to Drive (ID: {file_id})"
-        else:
-            # This case should ideally not be reached due to the retry logic raising an exception
-            logger.error(f"[UPLOAD FAILED] Upload failed for {video_filename} after retries.")
-            raise Exception(f"Upload failed for {video_filename} after {max_retries} retries.")
+        # Update task status to completed
+        if task_id:
+            update_task_status(
+                task_id, 
+                "UPLOAD_COMPLETE", 
+                f"Successfully uploaded {video_filename} (ID: {file_id})"
+            )
+        
+        logger.info(f"Successfully uploaded {video_filename} to Google Drive in {upload_time:.2f}s, file ID: {file_id}")
+        return f"Success: {video_filename} uploaded to Drive (ID: {file_id})"
             
     except Exception as e:
         logger.error(f"Error in download_and_upload_file for {video_filename}: {str(e)}", exc_info=True)
+        
+        # Update task status to error
+        if task_id:
+            update_task_status(
+                task_id, 
+                "ERROR", 
+                f"Error uploading {video_filename}: {str(e)}"
+            )
+        
         raise
 
 @celery.task(bind=True, max_retries=3)
@@ -589,3 +752,23 @@ def share_folder_with_email(drive_service, folder_name, email, recordings_folder
 
     logger.info(f"Shared folder {folder_name} with {email}")
     return folder_web_view_link
+
+# Add a helper function to update task status in Redis
+def update_task_status(task_id, status, message=None):
+    """Update task status in Redis for monitoring"""
+    try:
+        task_info_json = redis_client.get(f"task:{task_id}")
+        if task_info_json:
+            task_info = json.loads(task_info_json)
+        else:
+            task_info = {"task_id": task_id}
+            
+        task_info["status"] = status
+        if message:
+            task_info["message"] = message
+        task_info["update_time"] = datetime.now().isoformat()
+        
+        redis_client.set(f"task:{task_id}", json.dumps(task_info))
+        logger.info(f"Updated task {task_id} status: {status} - {message}")
+    except Exception as e:
+        logger.error(f"Error updating task status: {str(e)}")
