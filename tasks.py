@@ -13,6 +13,7 @@ from google.oauth2 import credentials as google_credentials
 from requests.exceptions import ConnectionError, ChunkedEncodingError
 import importlib.metadata
 import time
+import sys
 
 # More comprehensive monkey patch for EntryPoints issue in Python 3.12 with Celery
 def patch_celery_entry_points():
@@ -23,12 +24,44 @@ def patch_celery_entry_points():
         
         def patched_load_extension_class_names(namespace):
             try:
-                eps = importlib.metadata.entry_points()
-                result = {}
-                # Filter entry points for the requested namespace
-                for ep in eps:
-                    if ep.group == namespace:
-                        result[ep.name] = ep.value
+                # Different handling based on Python version
+                if sys.version_info >= (3, 10):
+                    # For Python 3.10+
+                    eps = importlib.metadata.entry_points()
+                    if hasattr(eps, 'select'):
+                        # Python 3.10 - 3.11 style
+                        eps_filtered = eps.select(group=namespace)
+                        result = {ep.name: ep.value for ep in eps_filtered}
+                    else:
+                        # Python 3.12+ style
+                        result = {}
+                        if namespace in eps:
+                            for ep in eps[namespace]:
+                                result[ep.name] = ep.value
+                else:
+                    # For Python < 3.10
+                    try:
+                        eps = importlib.metadata.entry_points()
+                        result = {}
+                        if hasattr(eps, 'get'):
+                            namespace_eps = eps.get(namespace, [])
+                            for ep in namespace_eps:
+                                result[ep.name] = ep.value
+                        else:
+                            # Fallback for older importlib.metadata versions
+                            for ep in eps:
+                                if ep.group == namespace:
+                                    result[ep.name] = ep.value
+                    except Exception:
+                        # Legacy fallback using pkg_resources if available
+                        try:
+                            import pkg_resources
+                            result = {}
+                            for ep in pkg_resources.iter_entry_points(namespace):
+                                result[ep.name] = f"{ep.module_name}:{'.'.join(ep.attrs)}"
+                        except ImportError:
+                            result = {}
+                
                 return result
             except Exception as e:
                 print(f"EntryPoints patch error: {e}")
@@ -68,6 +101,30 @@ celery.conf.update(
 
 redis_client = redis.from_url(redis_url)
 
+# Add a failsafe task wrapper that doesn't depend on the entry points patch
+def create_failsafe_task():
+    """
+    Creates a simpler task implementation that doesn't rely on complex Celery features
+    to ensure at least basic functionality works even if the patch fails
+    """
+    @celery.task(name='tasks.upload_safe', bind=True, max_retries=3)
+    def upload_safe(self, serialized_credentials, recordings):
+        """Simplified version of uploadFiles that serves as a fallback"""
+        print("Using failsafe upload task implementation")
+        try:
+            # Direct function call bypassing any complex Celery machinery
+            uploadFiles(serialized_credentials, recordings)
+            return "Completed failsafe upload task"
+        except Exception as e:
+            print(f"Error in failsafe task: {str(e)}")
+            if self.request.retries < 3:
+                self.retry(countdown=60, exc=e)
+            else:
+                raise
+    return upload_safe
+
+# Create the failsafe task
+upload_safe = create_failsafe_task()
 
 @celery.task(bind=True, max_retries=3)
 def uploadFiles(self_or_serialized_credentials=None, recordings_or_self=None, recordings=None):
