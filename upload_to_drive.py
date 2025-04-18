@@ -135,102 +135,64 @@ def index():
     """Main upload route - starts the Zoom to Drive transfer process"""
     logger.info("Upload process initiated")
     
-    try:
-        # Check if we have valid credentials first
-        credentials = None
-        serialized_credentials = redis_client.get('credentials')
-        
-        if serialized_credentials:
-            credentials = pickle.loads(serialized_credentials)
-            
-            # Check if access token is expired
-            if credentials.expired:
-                logger.info("Refreshing expired Google credentials")
-                refresh_token = redis_client.get('google_refresh_token')
+    serialized_credentials = redis_client.get('credentials')
+    
+    if serialized_credentials:
+        try:
+            # Get recordings from Zoom
+            logger.info("Fetching Zoom recordings")
+            recordings = download_zoom_recordings()
+            if not recordings:
+                logger.warning("No recordings found to upload")
+                return "No recordings found to upload"
                 
-                if not refresh_token:
-                    logger.error("No refresh token found")
-                    # Redirect to authorization flow to get a new refresh token
-                    return redirect_to_auth()
-                
-                try:
-                    # Try to refresh token
-                    refresh_success = refresh_google_token()
-                    if not refresh_success:
-                        logger.error("Failed to refresh token")
-                        return redirect_to_auth()
-                        
-                    # Get fresh credentials
-                    serialized_credentials = redis_client.get('credentials')
-                    if not serialized_credentials:
-                        logger.error("No credentials found after refresh")
-                        return redirect_to_auth()
-                        
-                    credentials = pickle.loads(serialized_credentials)
-                except Exception as e:
-                    logger.error(f"Error refreshing token: {str(e)}")
-                    return redirect_to_auth()
-        else:
-            logger.info("No credentials found, redirecting to authorization")
-            return redirect_to_auth()
+            # Start the folder setup and processing pipeline
+            # Pass the pickled credentials directly to the task
+            task = setup_folders.delay(serialized_credentials, recordings)
+            task_id = task.id
             
-        # Get recordings from Zoom
-        logger.info("Fetching Zoom recordings")
-        recordings = download_zoom_recordings()
-        if not recordings:
-            logger.warning("No recordings found to upload")
-            return "No recordings found to upload"
+            # Store task info in Redis for status tracking
+            task_info = {
+                'task_id': task_id,
+                'status': 'STARTED',
+                'recordings_count': len(recordings),
+                'start_time': datetime.now().isoformat(),
+            }
+            redis_client.set(f"task:{task_id}", json.dumps(task_info))
             
-        # Log first recording for debugging
-        if recordings and len(recordings) > 0:
-            first_topic = recordings[0].get('topic', 'Unknown')
-            logger.info(f"Starting task with {len(recordings)} recordings, first recording topic: {first_topic}")
-        
-        # Start the folder setup and processing pipeline
-        task = setup_folders.delay(serialized_credentials, recordings)
-        task_id = task.id
-        
-        # Store task info in Redis for status tracking
-        task_info = {
-            'task_id': task_id,
-            'status': 'STARTED',
-            'recordings_count': len(recordings),
-            'start_time': datetime.now().isoformat(),
-        }
-        redis_client.set(f"task:{task_id}", json.dumps(task_info))
-        
-        logger.info(f"Started processing with task ID: {task_id} for {len(recordings)} recordings")
-        return jsonify({
-            'status': 'success', 
-            'message': f"Processing started with task ID: {task_id}",
-            'task_id': task_id,
-            'recordings_count': len(recordings)
-        })
-    except Exception as e:
-        logger.error(f"Error starting upload process: {str(e)}", exc_info=True)
-        return jsonify({
-            'status': 'error',
-            'message': f"Error starting upload: {str(e)}"
-        })
-
-def redirect_to_auth():
-    """Helper function to redirect to Google OAuth"""
-    try:
-        authorization_url, state = flow.authorization_url(
-            access_type='offline',
-            include_granted_scopes='true',
-            prompt='consent'  # Force prompt to ensure we get a refresh token
-        )
-        # Store the state in Redis
-        redis_client.set('oauth_state', state)
-        logger.info("Redirecting to Google OAuth")
-        return redirect(authorization_url)
-    except Exception as e:
-        logger.error(f"Error during OAuth initialization: {str(e)}", exc_info=True)
-        return jsonify({
-            'status': 'error',
-            'message': f"Authentication error: {str(e)}"
-        })
+            logger.info(f"Started processing with task ID: {task_id} for {len(recordings)} recordings")
+            return jsonify({
+                'status': 'success', 
+                'message': f"Processing started with task ID: {task_id}",
+                'task_id': task_id,
+                'recordings_count': len(recordings)
+            })
+            
+        except Exception as e:
+            logger.error(f"Error starting upload process: {str(e)}", exc_info=True)
+            return jsonify({
+                'status': 'error',
+                'message': f"Error starting upload: {str(e)}"
+            })
+    else:
+        # Need to authenticate with Google first
+        logger.info("Google credentials not found - redirecting to OAuth flow")
+        try:
+            authorization_url, state = flow.authorization_url(
+                access_type='offline', # Request refresh token
+                include_granted_scopes='true',
+                prompt='consent' # Ensure refresh token is granted on re-auth
+            )
+            # Store the state in Redis
+            redis_client.set('oauth_state', state)
+            logger.info("Redirecting to Google OAuth")
+            return redirect(authorization_url)
+        except Exception as e:
+            logger.error(f"Error during OAuth initialization: {str(e)}", exc_info=True)
+            return jsonify({
+                'status': 'error',
+                'message': f"Authentication error: {str(e)}"
+            })
 
 @upload_blueprint.route('/upload_callback')
 def upload_callback():
@@ -253,24 +215,33 @@ def upload_callback():
         
         # Get credentials
         credentials = flow.credentials
+        refresh_token = credentials.refresh_token
         
-        # Ensure we have a refresh token
-        if not credentials.refresh_token:
-            logger.error("No refresh token received, retrying with consent prompt")
-            return redirect_to_auth()
-            
-        logger.info(f"Received access token and refresh token: {credentials.refresh_token[:5]}...")
-        
-        # Store credentials in Redis
+        # Log refresh token status
+        if refresh_token:
+            logger.info("Refresh token received from Google.")
+        else:
+            logger.warning("No refresh token received from Google. Re-authentication might be needed later or ensure 'prompt=consent' was used.")
+
+        # Store the complete credentials object (pickle)
         serialized_credentials = pickle.dumps(credentials)
         redis_client.set('credentials', serialized_credentials)
-        redis_client.set('google_access_token', credentials.token)
-        redis_client.set('google_refresh_token', credentials.refresh_token)
         
-        logger.info("Successfully authenticated with Google")
+        # Store access token separately (optional, but might be useful for quick checks)
+        redis_client.set('google_access_token', credentials.token)
+        
+        # Only store refresh token if it exists
+        if refresh_token:
+            redis_client.set('google_refresh_token', refresh_token)
+        else:
+            # If no new refresh token, delete any old one to avoid using a stale token
+            redis_client.delete('google_refresh_token')
+        
+        logger.info("Successfully authenticated with Google and stored credentials.")
         
         try:
             # Download and process recordings
+            logger.info("Proceeding to download recordings after authentication.")
             recordings = download_zoom_recordings()
             if not recordings:
                 logger.warning("No recordings found to upload after authentication")
@@ -321,67 +292,4 @@ def task_status(task_id):
             return jsonify({'status': 'not_found'})
     except Exception as e:
         logger.error(f"Error checking task status: {str(e)}")
-        return jsonify({'status': 'error', 'message': str(e)})
-
-@retry(
-    retry=retry_if_exception_type((ConnectionError, ChunkedEncodingError, Timeout)),
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=1, min=4, max=60)
-)
-def refresh_google_token():
-    """Refresh the Google access token with retries"""
-    try:
-        refresh_token = redis_client.get('google_refresh_token')
-        if not refresh_token:
-            logger.error("No refresh token found")
-            return False
-            
-        refresh_token = refresh_token.decode('utf-8')
-        token_url = 'https://oauth2.googleapis.com/token'
-        
-        with open(CLIENT_SECRETS_FILE, 'r') as secrets_file:
-            client_secrets = json.load(secrets_file)
-        
-        token_params = {
-            'client_id': client_secrets['web']['client_id'],
-            'client_secret': client_secrets['web']['client_secret'],
-            'grant_type': 'refresh_token',
-            'refresh_token': refresh_token
-        }
-        
-        response = requests.post(token_url, data=token_params, timeout=30)
-        if response.status_code == 200:
-            token_data = response.json()
-            access_token = token_data['access_token']
-            
-            # Update access token in Redis
-            redis_client.set('google_access_token', access_token)
-            
-            # Update the credentials object
-            serialized_credentials = redis_client.get('credentials')
-            if serialized_credentials:
-                credentials = pickle.loads(serialized_credentials)
-                credentials.token = access_token
-                redis_client.set('credentials', pickle.dumps(credentials))
-                
-            logger.info("Successfully refreshed Google access token")
-            return True
-        else:
-            logger.error(f"Failed to refresh token: {response.status_code} - {response.text}")
-            return False
-            
-    except Exception as e:
-        logger.error(f"Error refreshing token: {str(e)}")
-        raise
-
-@upload_blueprint.route('/refresh_token')
-def refresh_token_route():
-    """Manual route to refresh the Google access token"""
-    try:
-        success = refresh_google_token()
-        if success:
-            return jsonify({'status': 'success', 'message': 'Token refreshed successfully'})
-        else:
-            return jsonify({'status': 'error', 'message': 'Failed to refresh token'})
-    except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
