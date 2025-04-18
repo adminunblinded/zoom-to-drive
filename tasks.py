@@ -103,7 +103,7 @@ celery.conf.update(
     task_acks_late=True,  # Only acknowledge tasks after they're completed
     task_create_missing_queues=True,
     task_default_queue='default',
-    worker_pool='gevent',  # Use gevent pool for non-blocking I/O
+    worker_pool='prefork',  # Changed from gevent to prefork for better reliability
     worker_pool_restarts=True,
     task_routes={
         'tasks.setup_folders': {'queue': 'setup'},
@@ -143,6 +143,19 @@ def setup_folders(self, serialized_credentials, recordings):
         credentials = pickle.loads(serialized_credentials)
         API_VERSION = 'v3'
         
+        # Test that credentials are valid
+        try:
+            if credentials.expired and credentials.refresh_token:
+                logger.info("Refreshing expired Google credentials inside setup_folders task")
+                from google.auth.transport.requests import Request
+                credentials.refresh(Request())
+                # Re-serialize the refreshed credentials
+                serialized_credentials = pickle.dumps(credentials)
+                logger.info("Google credentials refreshed successfully")
+        except Exception as e:
+            logger.error(f"Error refreshing Google credentials in setup_folders: {str(e)}", exc_info=True)
+            raise RuntimeError(f"Google credentials error: {str(e)}")
+        
         # Build drive service with timeout settings
         drive_service = build(
             'drive', 
@@ -150,11 +163,19 @@ def setup_folders(self, serialized_credentials, recordings):
             credentials=credentials,
             cache_discovery=False  # Avoid caching issues
         )
+        
+        # Test that drive_service is working
+        try:
+            about = drive_service.about().get(fields='user').execute()
+            logger.info(f"Drive service initialized successfully for user: {about.get('user', {}).get('emailAddress', 'Unknown')}")
+        except Exception as e:
+            logger.error(f"Error testing Drive service: {str(e)}", exc_info=True)
+            raise RuntimeError(f"Drive service error: {str(e)}")
 
         # Check if the "Automated Zoom Recordings" folder already exists
         results = drive_service.files().list(
             q="name='Automated Zoom Recordings' and mimeType='application/vnd.google-apps.folder'",
-            fields='files(id)',
+            fields='files(id, name)',
             spaces='drive'
         ).execute()
 
@@ -167,7 +188,7 @@ def setup_folders(self, serialized_credentials, recordings):
                 'name': 'Automated Zoom Recordings',
                 'mimeType': 'application/vnd.google-apps.folder'
             }
-            recordings_folder = drive_service.files().create(body=file_metadata, fields='id').execute()
+            recordings_folder = drive_service.files().create(body=file_metadata, fields='id, name').execute()
             recordings_folder_id = recordings_folder['id']
             logger.info(f"Created new Automated Zoom Recordings folder: {recordings_folder_id}")
         
@@ -218,12 +239,13 @@ def setup_folders(self, serialized_credentials, recordings):
                 # Check if folder exists
                 results = drive_service.files().list(
                     q=f"name='{folder_name}' and '{recordings_folder_id}' in parents and mimeType='application/vnd.google-apps.folder'",
-                    fields='files(id)',
+                    fields='files(id, name)',
                     spaces='drive'
                 ).execute()
 
                 if len(results['files']) > 0:
                     folder_id = results['files'][0]['id']
+                    logger.info(f"Found existing folder '{folder_name}' with ID: {folder_id}")
                 else:
                     # Create folder if it doesn't exist
                     file_metadata = {
@@ -231,7 +253,7 @@ def setup_folders(self, serialized_credentials, recordings):
                         'mimeType': 'application/vnd.google-apps.folder',
                         'parents': [recordings_folder_id]
                     }
-                    folder = drive_service.files().create(body=file_metadata, fields='id').execute()
+                    folder = drive_service.files().create(body=file_metadata, fields='id, name').execute()
                     folder_id = folder['id']
                     logger.info(f"Created new folder: {folder_name} with ID: {folder_id}")
                 
@@ -245,20 +267,51 @@ def setup_folders(self, serialized_credentials, recordings):
         logger.info(f"Saved {len(folder_ids)} folder IDs to Redis")
         
         # Queue recording uploads with staggered delays
+        queued_tasks = 0
         for i, recording in enumerate(recordings):
             # Use countdown to stagger the tasks
             delay = i * 5 % 300  # Spread tasks over a 5-minute window
-            upload_recording.apply_async(
+            upload_task = upload_recording.apply_async(
                 args=[serialized_credentials, recording, recordings_folder_id],
                 countdown=delay,
                 queue='upload'
             )
+            queued_tasks += 1
+            logger.info(f"Queued upload task {i+1}/{len(recordings)} with ID: {upload_task.id} for topic: {recording.get('topic', 'Unknown')}")
+            time.sleep(0.1)  # Small delay to ensure proper task queueing
             
-        logger.info(f"Queued {len(recordings)} upload_recording tasks")
-        return f"Setup complete - {len(recordings)} recordings queued for processing"
+        logger.info(f"Queued {queued_tasks} upload_recording tasks")
+        
+        # Update task status in Redis
+        try:
+            task_info = {
+                'task_id': task_id,
+                'status': 'FOLDERS_CREATED',
+                'recordings_count': len(recordings),
+                'queued_uploads': queued_tasks,
+                'folders_created': len(folder_ids),
+                'update_time': datetime.now().isoformat(),
+            }
+            redis_client.set(f"task:{task_id}", json.dumps(task_info))
+        except Exception as e:
+            logger.error(f"Error updating task status: {str(e)}")
+            
+        return f"Setup complete - {queued_tasks} recordings queued for processing"
             
     except Exception as e:
         logger.error(f"Error in setup_folders task: {str(e)}", exc_info=True)
+        # Update task status in Redis
+        try:
+            task_info = {
+                'task_id': task_id,
+                'status': 'ERROR',
+                'error': str(e),
+                'update_time': datetime.now().isoformat(),
+            }
+            redis_client.set(f"task:{task_id}", json.dumps(task_info))
+        except Exception as redis_err:
+            logger.error(f"Error updating task error status: {str(redis_err)}")
+            
         # Use exponential backoff for retries
         retry_delay = 30 * (2 ** self.request.retries)
         raise self.retry(exc=e, countdown=retry_delay, max_retries=5)
@@ -274,11 +327,24 @@ def setup_folders(self, serialized_credentials, recordings):
 def upload_recording(self, serialized_credentials, recording, recordings_folder_id):
     task_id = self.request.id
     recording_topic = recording.get('topic', 'Unknown')
-    logger.info(f"Starting upload_recording task {task_id} for '{recording_topic}'")
+    recording_uuid = recording.get('uuid', 'Unknown')
+    logger.info(f"Starting upload_recording task {task_id} for '{recording_topic}' (ID: {recording_uuid})")
     
     try:
         credentials = pickle.loads(serialized_credentials)
         API_VERSION = 'v3'
+        
+        # Check if credentials need refreshing
+        try:
+            if credentials.expired and credentials.refresh_token:
+                logger.info(f"Refreshing expired Google credentials in upload_recording for {recording_topic}")
+                from google.auth.transport.requests import Request
+                credentials.refresh(Request())
+                serialized_credentials = pickle.dumps(credentials)
+        except Exception as e:
+            logger.error(f"Error refreshing Google credentials in upload_recording: {str(e)}", exc_info=True)
+            # Don't raise here, try to continue with the existing credentials
+        
         drive_service = build('drive', API_VERSION, credentials=credentials, cache_discovery=False)
         
         topics = recording['topic']
@@ -292,29 +358,34 @@ def upload_recording(self, serialized_credentials, recording, recordings_folder_
             if folder_ids_data:
                 folder_ids = json.loads(folder_ids_data)
                 folder_id = folder_ids.get(topics)
+                if folder_id:
+                    logger.info(f"Retrieved folder ID for '{topics}' from Redis: {folder_id}")
         except Exception as e:
             logger.warning(f"Error retrieving folder ID from Redis: {str(e)}")
         
         # If folder ID not found in Redis, look up directly
         if not folder_id:
+            logger.info(f"Folder ID for '{topics}' not found in Redis, looking up in Drive")
             results = drive_service.files().list(
                 q=f"name='{folder_name}' and '{recordings_folder_id}' in parents and mimeType='application/vnd.google-apps.folder'",
-                fields='files(id)',
+                fields='files(id, name)',
                 spaces='drive'
             ).execute()
 
             if len(results['files']) > 0:
                 folder_id = results['files'][0]['id']
+                logger.info(f"Found folder '{folder_name}' in Drive with ID: {folder_id}")
             else:
                 # Create folder if needed
+                logger.info(f"Folder '{folder_name}' not found, creating new folder")
                 file_metadata = {
                     'name': folder_name,
                     'mimeType': 'application/vnd.google-apps.folder',
                     'parents': [recordings_folder_id]
                 }
-                folder = drive_service.files().create(body=file_metadata, fields='id').execute()
+                folder = drive_service.files().create(body=file_metadata, fields='id, name').execute()
                 folder_id = folder['id']
-                logger.info(f"Created new folder during upload: {folder_name}")
+                logger.info(f"Created new folder during upload: {folder_name} with ID: {folder_id}")
         
         # Count valid files for processing
         valid_files = [
@@ -322,25 +393,39 @@ def upload_recording(self, serialized_credentials, recording, recordings_folder_
             if f['status'] == 'completed' and f['file_extension'] == 'MP4' and recording['duration'] >= 10
         ]
         
-        logger.info(f"Processing {len(valid_files)} valid files for recording '{recording_topic}'")
+        total_files = len(recording['recording_files'])
+        logger.info(f"Processing {len(valid_files)}/{total_files} valid files for recording '{recording_topic}'")
                 
         # Process each file in the recording
+        queued_file_tasks = 0
         for i, file_data in enumerate(recording['recording_files']):
             if (file_data['status'] == 'completed' and 
                 file_data['file_extension'] == 'MP4' and 
                 recording['duration'] >= 10):
                 
+                # Get file name for logging
+                file_name = file_data.get('file_name', f"file_{file_data.get('id', 'unknown')}")
+                
                 # Queue with small delay between files from same recording
-                process_file.apply_async(
+                file_task = process_file.apply_async(
                     args=[serialized_credentials, recording, file_data, folder_id],
                     countdown=i * 10,  # 10-second delay between files
                     queue='process'
                 )
+                queued_file_tasks += 1
+                logger.info(f"Queued file {i+1}/{len(valid_files)} with task ID: {file_task.id}, file: {file_name}")
+                
+                # Brief pause to ensure proper task scheduling
+                time.sleep(0.1)
+                
+        if queued_file_tasks == 0:
+            logger.warning(f"No valid files to process for recording '{recording_topic}'")
         
-        return f"Queued {len(valid_files)} files for processing from recording '{recording_topic}'"
+        logger.info(f"Successfully queued {queued_file_tasks} files for processing from recording '{recording_topic}'")
+        return f"Queued {queued_file_tasks} files for processing from recording '{recording_topic}'"
             
     except Exception as e:
-        logger.error(f"Error processing recording '{recording_topic}': {str(e)}")
+        logger.error(f"Error processing recording '{recording_topic}': {str(e)}", exc_info=True)
         retry_delay = 60 * (2 ** self.request.retries)
         raise self.retry(exc=e, countdown=retry_delay)
 
@@ -352,11 +437,25 @@ def upload_recording(self, serialized_credentials, recording, recordings_folder_
 )
 def download_with_retry(download_url):
     """Download file with retry logic using tenacity"""
+    headers = {}
+    # Add authorization if needed and not already in URL
+    if "?zak=" not in download_url and "&zak=" not in download_url:
+        # Add JWT token if available
+        access_token = redis_client.get('access_token')
+        if access_token:
+            headers["Authorization"] = f"Bearer {access_token.decode()}"
+            logger.info("Using JWT token for download authorization")
+    
     response = requests.get(
         download_url, 
+        headers=headers,
         stream=True,
-        timeout=(10, 60)  # 10s connect, 60s read
+        timeout=(10, 120)  # 10s connect, 120s read
     )
+    
+    # Log response details for debugging
+    logger.info(f"Download response: status={response.status_code}, content-type={response.headers.get('content-type')}, content-length={response.headers.get('content-length')}")
+    
     response.raise_for_status()
     return response
 
@@ -371,18 +470,31 @@ def download_with_retry(download_url):
 def process_file(self, serialized_credentials, recording, file_data, folder_id):
     task_id = self.request.id
     file_id = file_data.get('id', 'Unknown')
+    file_name = file_data.get('file_name', f"file_{file_id}")
     topics = recording.get('topic', 'Unknown')
     
-    logger.info(f"Starting process_file task {task_id} for file {file_id} from '{topics}'")
+    logger.info(f"Starting process_file task {task_id} for file {file_name} (ID: {file_id}) from '{topics}'")
     
     try:
         # Skip non-video files or short recordings
         if file_data['status'] != 'completed' or file_data['file_extension'] != 'MP4' or recording['duration'] < 10:
-            logger.info(f"Skipping file {file_id} - not a completed MP4 or too short")
+            logger.info(f"Skipping file {file_name} - not a completed MP4 or too short")
             return "Skipped - not a valid video file"
             
         credentials = pickle.loads(serialized_credentials)
         API_VERSION = 'v3'
+        
+        # Check if credentials need refreshing
+        try:
+            if credentials.expired and credentials.refresh_token:
+                logger.info(f"Refreshing expired Google credentials in process_file for {file_name}")
+                from google.auth.transport.requests import Request
+                credentials.refresh(Request())
+                serialized_credentials = pickle.dumps(credentials)
+        except Exception as e:
+            logger.error(f"Error refreshing Google credentials in process_file: {str(e)}", exc_info=True)
+            raise RuntimeError(f"Failed to refresh Google credentials: {str(e)}")
+            
         drive_service = build('drive', API_VERSION, credentials=credentials, cache_discovery=False)
         
         start_time = recording['start_time']
@@ -392,42 +504,113 @@ def process_file(self, serialized_credentials, recording, file_data, folder_id):
         video_filename = video_filename.replace("'", "\\'")
         download_url = file_data['download_url']
         
+        logger.info(f"Preparing to download and upload file: {video_filename}")
+        
         # Check if file already exists
         query = f"name='{video_filename}' and '{folder_id}' in parents"
         existing_files = drive_service.files().list(
             q=query,
-            fields='files(id)',
+            fields='files(id, name)',
             spaces='drive'
         ).execute()
 
         if len(existing_files['files']) > 0:
-            logger.info(f"Skipping upload of '{video_filename}' as it already exists in Drive")
+            existing_file_id = existing_files['files'][0]['id']
+            logger.info(f"Skipping upload of '{video_filename}' as it already exists in Drive with ID: {existing_file_id}")
+            
+            # Update task status in Redis
+            try:
+                task_info = {
+                    'task_id': task_id,
+                    'status': 'FILE_EXISTS',
+                    'file_name': video_filename,
+                    'drive_file_id': existing_file_id,
+                    'update_time': datetime.now().isoformat(),
+                }
+                redis_client.set(f"file_task:{task_id}", json.dumps(task_info))
+            except Exception as e:
+                logger.error(f"Error updating file task status: {str(e)}")
+                
             return f"Skipped - file already exists: {video_filename}"
+        
+        # Update task status in Redis - started download
+        try:
+            task_info = {
+                'task_id': task_id,
+                'status': 'DOWNLOADING',
+                'file_name': video_filename,
+                'start_time': datetime.now().isoformat(),
+            }
+            redis_client.set(f"file_task:{task_id}", json.dumps(task_info))
+        except Exception as e:
+            logger.error(f"Error updating file task status: {str(e)}")
             
         # Download and upload with enhanced error handling
         result = download_and_upload_file(self, drive_service, download_url, video_filename, folder_id)
-        logger.info(f"Successfully processed file {file_id}: {result}")
+        
+        # Update task status in Redis - completed
+        try:
+            task_info = {
+                'task_id': task_id,
+                'status': 'COMPLETED',
+                'file_name': video_filename,
+                'result': result,
+                'completion_time': datetime.now().isoformat(),
+            }
+            redis_client.set(f"file_task:{task_id}", json.dumps(task_info))
+        except Exception as e:
+            logger.error(f"Error updating file task status: {str(e)}")
+            
+        logger.info(f"Successfully processed file {file_name}: {result}")
         return result
             
     except Exception as e:
-        logger.error(f"Error processing file {file_id}: {str(e)}", exc_info=True)
+        logger.error(f"Error processing file {file_name}: {str(e)}", exc_info=True)
+        
+        # Update task status in Redis - error
+        try:
+            task_info = {
+                'task_id': task_id,
+                'status': 'ERROR',
+                'file_name': file_data.get('file_name', 'Unknown'),
+                'error': str(e),
+                'error_time': datetime.now().isoformat(),
+            }
+            redis_client.set(f"file_task:{task_id}", json.dumps(task_info))
+        except Exception as redis_err:
+            logger.error(f"Error updating file task error status: {str(redis_err)}")
+            
         retry_delay = 60 * (2 ** self.request.retries)
         raise self.retry(exc=e, countdown=retry_delay)
 
 def download_and_upload_file(task, drive_service, download_url, video_filename, folder_id):
     """Download and upload a file with enhanced error handling and monitoring"""
     chunk_size = 1024 * 1024  # 1MB chunks
+    task_id = task.request.id
     
     # Use tenacity retry for downloads
     try:
         logger.info(f"Starting download of {video_filename}")
         start_time = time.time()
         
+        # Use authorization header if in download URL
+        headers = {}
+        if "?zak=" in download_url or "&zak=" in download_url:
+            logger.info("Download URL contains authorization token")
+        else:
+            # Add JWT token if available
+            access_token = redis_client.get('access_token')
+            if access_token:
+                headers["Authorization"] = f"Bearer {access_token.decode()}"
+                logger.info("Added authorization header for download")
+        
         # Download file with retry
+        logger.info(f"Initiating download from: {download_url[:100]}...")
         response = download_with_retry(download_url)
         
         # Track file size for logging
         content_length = int(response.headers.get('content-length', 0))
+        logger.info(f"Content length reported: {content_length} bytes ({content_length/(1024*1024):.2f} MB)")
         
         # Capture video in memory buffer
         video_content = io.BytesIO()
@@ -442,6 +625,21 @@ def download_and_upload_file(task, drive_service, download_url, video_filename, 
                 if content_length > 50 * 1024 * 1024 and bytes_downloaded % (20 * 1024 * 1024) == 0:  # Log every 20MB
                     percent = (bytes_downloaded / content_length) * 100 if content_length else 0
                     logger.info(f"Downloaded {bytes_downloaded/(1024*1024):.1f}MB of {video_filename} ({percent:.1f}%)")
+                    
+                    # Update Redis with progress
+                    try:
+                        task_info = {
+                            'task_id': task_id,
+                            'status': 'DOWNLOADING',
+                            'file_name': video_filename,
+                            'bytes_downloaded': bytes_downloaded,
+                            'total_bytes': content_length,
+                            'percent_complete': percent,
+                            'update_time': datetime.now().isoformat(),
+                        }
+                        redis_client.set(f"file_task:{task_id}", json.dumps(task_info))
+                    except Exception as e:
+                        logger.error(f"Error updating download progress: {str(e)}")
                 
                 # Brief pause every 10MB to prevent timeouts
                 if bytes_downloaded % (10 * chunk_size) == 0:
@@ -449,6 +647,24 @@ def download_and_upload_file(task, drive_service, download_url, video_filename, 
         
         download_time = time.time() - start_time
         logger.info(f"Downloaded {bytes_downloaded/(1024*1024):.1f}MB in {download_time:.2f}s ({bytes_downloaded/download_time/1024/1024:.2f}MB/s)")
+        
+        # Verify we got the file
+        if bytes_downloaded == 0:
+            raise Exception("Downloaded file has zero bytes")
+            
+        # Update Redis with upload start
+        try:
+            task_info = {
+                'task_id': task_id,
+                'status': 'UPLOADING',
+                'file_name': video_filename,
+                'bytes_downloaded': bytes_downloaded,
+                'download_time': download_time,
+                'update_time': datetime.now().isoformat(),
+            }
+            redis_client.set(f"file_task:{task_id}", json.dumps(task_info))
+        except Exception as e:
+            logger.error(f"Error updating upload start status: {str(e)}")
         
         # Reset file pointer for upload
         video_content.seek(0)
@@ -474,7 +690,7 @@ def download_and_upload_file(task, drive_service, download_url, video_filename, 
         request = drive_service.files().create(
             body=file_metadata,
             media_body=media,
-            fields='id'
+            fields='id,name,webViewLink'
         )
         
         # Process the upload in chunks with exponential backoff for errors
@@ -482,30 +698,71 @@ def download_and_upload_file(task, drive_service, download_url, video_filename, 
         backoff = 1
         retries = 0
         max_retries = 10
+        last_progress = 0
         
         while response is None and retries < max_retries:
             try:
                 status, response = request.next_chunk()
                 if status:
                     progress = int(status.progress() * 100)
-                    # Only log every 20% for large files
-                    if progress % 20 == 0:
+                    # Only log when progress changes significantly
+                    if progress - last_progress >= 10:
                         logger.info(f"Uploaded {progress}% of {video_filename}")
+                        last_progress = progress
+                        
+                        # Update Redis with upload progress
+                        try:
+                            task_info = {
+                                'task_id': task_id,
+                                'status': 'UPLOADING',
+                                'file_name': video_filename,
+                                'upload_progress': progress,
+                                'update_time': datetime.now().isoformat(),
+                            }
+                            redis_client.set(f"file_task:{task_id}", json.dumps(task_info))
+                        except Exception as e:
+                            logger.error(f"Error updating upload progress: {str(e)}")
                         
             except Exception as e:
                 retries += 1
                 if retries >= max_retries:
+                    logger.error(f"Final upload attempt failed: {str(e)}")
                     raise Exception(f"Failed to upload {video_filename} after {max_retries} retries: {str(e)}")
                 
                 logger.warning(f"Upload error, attempt {retries}/{max_retries}, retrying in {backoff}s: {str(e)}")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60)  # Cap backoff at 60 seconds
         
+        if response is None:
+            raise Exception(f"Upload failed - no response after {max_retries} attempts")
+            
         upload_time = time.time() - upload_start_time
         file_id = response.get('id', 'unknown')
+        web_view_link = response.get('webViewLink', '')
         
+        # Log success with file details
         logger.info(f"Successfully uploaded {video_filename} to Google Drive in {upload_time:.2f}s, file ID: {file_id}")
-        return f"Success: {video_filename} uploaded to Drive (ID: {file_id})"
+        
+        # Store latest successful upload in Redis for monitoring
+        try:
+            upload_info = {
+                'file_name': video_filename,
+                'file_id': file_id,
+                'web_view_link': web_view_link,
+                'folder_id': folder_id,
+                'bytes': bytes_downloaded,
+                'upload_time': upload_time,
+                'completed_at': datetime.now().isoformat(),
+            }
+            redis_client.set("last_successful_upload", json.dumps(upload_info))
+            
+            # Update a counter of successful uploads
+            success_count = redis_client.incr("successful_uploads_count")
+            logger.info(f"Total successful uploads: {success_count}")
+        except Exception as e:
+            logger.error(f"Error updating successful upload metrics: {str(e)}")
+            
+        return f"Success: {video_filename} uploaded to Drive (ID: {file_id}, Link: {web_view_link})"
             
     except Exception as e:
         logger.error(f"Error in download_and_upload_file for {video_filename}: {str(e)}", exc_info=True)

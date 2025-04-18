@@ -150,7 +150,25 @@ def index():
                 logger.error("Google credentials not found")
                 return "Google credentials not found, please authenticate again"
             
+            # Verify credentials are valid before proceeding
+            try:
+                credentials = pickle.loads(serialized_credentials)
+                if credentials.expired and credentials.refresh_token:
+                    logger.info("Refreshing expired Google credentials")
+                    refresh_google_token()
+                    serialized_credentials = redis_client.get('credentials')
+                    if not serialized_credentials:
+                        logger.error("Failed to refresh Google credentials")
+                        return "Failed to refresh Google credentials, please authenticate again"
+            except Exception as e:
+                logger.error(f"Error checking Google credentials: {str(e)}", exc_info=True)
+                return jsonify({
+                    'status': 'error',
+                    'message': f"Invalid Google credentials: {str(e)}"
+                })
+                
             # Start the folder setup and processing pipeline
+            logger.info(f"Starting task with {len(recordings)} recordings, first recording topic: {recordings[0].get('topic', 'Unknown') if recordings else 'None'}")
             task = setup_folders.delay(serialized_credentials, recordings)
             task_id = task.id
             
