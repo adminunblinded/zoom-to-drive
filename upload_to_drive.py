@@ -56,19 +56,49 @@ def retrieve_parameters():
 def index():
     access_token = redis_client.get('google_access_token')
     if access_token:
-        recordings = download_zoom_recordings()
-        serialized_credentials = redis_client.get('credentials')
-        
         try:
-            # Use the most basic form of task invocation
-            from tasks import uploadFiles as upload_task_func
-            # Call the function directly to avoid Celery machinery
-            upload_task_func(serialized_credentials, recordings)
-            return "Recordings are being uploaded"
+            # Download recordings but with a timeout
+            recordings = download_zoom_recordings()
+            
+            if not recordings:
+                return "No recordings found or error retrieving recordings"
+                
+            total_recordings = len(recordings)
+            if total_recordings > 0:
+                serialized_credentials = redis_client.get('credentials')
+                
+                # Limit batch size for large datasets
+                max_batch_size = 20
+                if total_recordings > max_batch_size:
+                    # Process larger datasets in multiple batches
+                    try:
+                        from tasks import uploadFiles
+                        # Start processing the first batch immediately
+                        uploadFiles.delay(serialized_credentials, recordings[:max_batch_size])
+                        
+                        # Queue the remaining batches
+                        for i in range(max_batch_size, total_recordings, max_batch_size):
+                            batch = recordings[i:min(i+max_batch_size, total_recordings)]
+                            uploadFiles.delay(serialized_credentials, batch)
+                            
+                        return f"Processing {total_recordings} recordings in multiple batches"
+                    except Exception as e:
+                        print(f"Error starting batch upload tasks: {str(e)}")
+                        return f"Error starting batch uploads: {str(e)}"
+                else:
+                    try:
+                        # For smaller datasets, use a single task
+                        from tasks import uploadFiles
+                        uploadFiles.delay(serialized_credentials, recordings)
+                        return f"Processing {total_recordings} recordings"
+                    except Exception as e:
+                        print(f"Error starting upload task: {str(e)}")
+                        return f"Error starting upload: {str(e)}"
+            else:
+                return "No recordings found to process"
         except Exception as e:
-            # Log the exception and return an error message
-            print(f"Error starting upload task: {str(e)}")
-            return f"Error starting upload: {str(e)}"
+            print(f"Error in upload process: {str(e)}")
+            return f"Error in upload process: {str(e)}"
     else:
         authorization_url, state = flow.authorization_url(
             access_type='offline',
@@ -109,30 +139,39 @@ def upload_callback():
         'refresh_token': refresh_token
     }
     
-    response = requests.post(token_url, data=token_params)
-    if response.status_code == 200:
-        new_credentials = response.json()
-        new_access_token = new_credentials['access_token']
+    try:
+        response = requests.post(token_url, data=token_params, timeout=30)
+        if response.status_code == 200:
+            new_credentials = response.json()
+            new_access_token = new_credentials['access_token']
 
-        # Store the new access token in Redis
-        redis_client.set('google_access_token', new_access_token)
+            # Store the new access token in Redis
+            redis_client.set('google_access_token', new_access_token)
 
-        # Update the existing credentials with the new access token
-        credentials.token = new_access_token
+            # Update the existing credentials with the new access token
+            credentials.token = new_access_token
 
-        recordings = download_zoom_recordings()
-        serialized_credentials = pickle.dumps(credentials)
-        redis_client.set('credentials', serialized_credentials)
+            recordings = download_zoom_recordings()
+            
+            if not recordings or len(recordings) == 0:
+                return "No recordings found or error retrieving recordings"
+                
+            serialized_credentials = pickle.dumps(credentials)
+            redis_client.set('credentials', serialized_credentials)
 
-        try:
-            # Use the most basic form of task invocation
-            from tasks import uploadFiles as upload_task_func
-            # Call the function directly to avoid Celery machinery
-            upload_task_func(serialized_credentials, recordings)
-            return "Recordings are being uploaded"
-        except Exception as e:
-            # Log the exception and return an error message
-            print(f"Error starting upload task: {str(e)}")
-            return f"Error starting upload: {str(e)}"
-    else:
-        return "Failed to refresh access token"
+            # Use Celery task for background processing
+            try:
+                from tasks import uploadFiles
+                uploadFiles.delay(serialized_credentials, recordings)
+                return f"Authorization successful. Processing {len(recordings)} recordings in the background."
+            except Exception as e:
+                print(f"Error starting upload task: {str(e)}")
+                return f"Authorization successful but error starting upload: {str(e)}"
+        else:
+            error_msg = f"Failed to refresh access token: {response.text}"
+            print(error_msg)
+            return error_msg
+    except Exception as e:
+        error_msg = f"Error during token refresh: {str(e)}"
+        print(error_msg)
+        return error_msg

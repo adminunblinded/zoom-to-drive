@@ -12,6 +12,7 @@ from googleapiclient.http import MediaIoBaseUpload
 from google.oauth2 import credentials as google_credentials
 from requests.exceptions import ConnectionError, ChunkedEncodingError
 import importlib.metadata
+import time
 
 # More comprehensive monkey patch for EntryPoints issue in Python 3.12 with Celery
 def patch_celery_entry_points():
@@ -105,109 +106,167 @@ def uploadFiles(self_or_serialized_credentials=None, recordings_or_self=None, re
             recordings_folder = drive_service.files().create(body=file_metadata, fields='id').execute()
             recordings_folder_id = recordings_folder['id']
         
-        for recording in recordings:
-            topics = recording['topic']
-            folder_name = topics.replace(" ", "_")  # Replacing spaces with underscores
-            folder_name = folder_name.replace("'", "\\'")  # Escape single quotation mark
+        # Process recordings in batches to prevent timeouts
+        batch_size = 5
+        total_recordings = len(recordings)
+        
+        for i in range(0, total_recordings, batch_size):
+            batch = recordings[i:i+batch_size]
             
-            folder_urls_data = redis_client.get("folder_urls")
-            if folder_urls_data:
-                existing_folder_urls = json.loads(folder_urls_data)
-            else:
-                existing_folder_urls = {}
-                
-            # Retrieve the stored_params dictionary from Redis
-            stored_params_data = redis_client.get("stored_params")
-            if stored_params_data:
-                stored_params = json.loads(stored_params_data)
-            else:
-                stored_params = {}
-                
-            # Check if the accountName is in the topic
-            for accountName, email in stored_params.items():
-                if accountName is not None and email is not None:
-                    if accountName in topics and accountName not in existing_folder_urls:
-                        # Share the folder with the email
-                        folder_url = share_folder_with_email(drive_service, folder_name, email, recordings_folder_id)
-                        existing_folder_urls[accountName] = folder_url
-                
-            # Store the updated data back into the Redis database
-            redis_client.set("folder_urls", json.dumps(existing_folder_urls))
-
-            # Check if the folder already exists within "Automated Zoom Recordings"
-            results = drive_service.files().list(
-                q=f"name='{folder_name}' and '{recordings_folder_id}' in parents and mimeType='application/vnd.google-apps.folder'",
-                fields='files(id)',
-                spaces='drive'
-            ).execute()
-
-            if len(results['files']) > 0:
-                folder_id = results['files'][0]['id']
-            else:
-                # Create the folder within "Automated Zoom Recordings" if it doesn't exist
-                file_metadata = {
-                    'name': folder_name,
-                    'mimeType': 'application/vnd.google-apps.folder',
-                    'parents': [recordings_folder_id]
-                }
-                folder = drive_service.files().create(body=file_metadata, fields='id').execute()
-                folder_id = folder['id']
-
-            for files in recording['recording_files']:
-                start_time = recording['start_time']
-                start_datetime = datetime.strptime(start_time, "%Y-%m-%dT%H:%M:%SZ")
-                date_string = start_datetime.strftime("%Y-%m-%d_%H-%M-%S")  # Updated format
-                video_filename = f"{topics}_{date_string}.mp4"
-                video_filename = video_filename.replace("'", "\\'")  # Escape single quotation mark
-                download_url = files['download_url']
-                
-                if files['status'] == 'completed' and files['file_extension'] == 'MP4' and recording['duration'] >= 10:
-                    try:
-                        response = requests.get(download_url, stream=True)
-                        response.raise_for_status()
-
-                        # Check if a file with the same name already exists in the folder
-                        query = f"name='{video_filename}' and '{folder_id}' in parents"
-                        existing_files = drive_service.files().list(
-                            q=query,
-                            fields='files(id)',
-                            spaces='drive'
-                        ).execute()
-
-                        if len(existing_files['files']) > 0:
-                            # File with the same name already exists, skip uploading
-                            print(f"Skipping upload of '{video_filename}' as it already exists.")
-                            continue
-
-                        # Capture the video content in a BytesIO object
-                        video_content = io.BytesIO()
-                        for chunk in response.iter_content(chunk_size=2048 * 2048):  # Chunks of 2MB
-                            if chunk:
-                                video_content.write(chunk)
-
-                        # Reset the file pointer to the beginning of the content
-                        video_content.seek(0)
-
-                        # Upload the video to the folder in Google Drive
-                        file_metadata = {
-                            'name': video_filename,
-                            'parents': [folder_id]
-                        }
-                        media = MediaIoBaseUpload(video_content, mimetype='video/mp4', resumable=True)
-
-                        drive_service.files().create(
-                            body=file_metadata,
-                            media_body=media,
-                            fields='id'
-                        ).execute()
-
-                    except (ConnectionError, ChunkedEncodingError) as e:
-                        print(f"Error occurred while downloading or uploading recording: {str(e)}")
-                        self.retry(countdown=10)  # Retry after 10 seconds
+            # Process each recording in the batch
+            for recording in batch:
+                try:
+                    process_recording(drive_service, recording, recordings_folder_id)
+                except Exception as e:
+                    print(f"Error processing recording {recording.get('topic', 'unknown')}: {str(e)}")
+                    # Continue with next recording instead of failing the entire batch
 
     except Exception as e:
-        print(f"An error occurred: {str(e)}")
+        print(f"An error occurred in uploadFiles: {str(e)}")
+        # For Celery task, retry with exponential backoff
+        if hasattr(self_or_serialized_credentials, 'retry'):
+            self_or_serialized_credentials.retry(exc=e, countdown=min(2 ** self_or_serialized_credentials.request.retries, 60))
+
+def process_recording(drive_service, recording, recordings_folder_id):
+    topics = recording['topic']
+    folder_name = topics.replace(" ", "_")  # Replacing spaces with underscores
+    folder_name = folder_name.replace("'", "\\'")  # Escape single quotation mark
+    
+    folder_urls_data = redis_client.get("folder_urls")
+    if folder_urls_data:
+        existing_folder_urls = json.loads(folder_urls_data)
+    else:
+        existing_folder_urls = {}
         
+    # Retrieve the stored_params dictionary from Redis
+    stored_params_data = redis_client.get("stored_params")
+    if stored_params_data:
+        stored_params = json.loads(stored_params_data)
+    else:
+        stored_params = {}
+        
+    # Check if the accountName is in the topic
+    for accountName, email in stored_params.items():
+        if accountName is not None and email is not None:
+            if accountName in topics and accountName not in existing_folder_urls:
+                # Share the folder with the email
+                folder_url = share_folder_with_email(drive_service, folder_name, email, recordings_folder_id)
+                existing_folder_urls[accountName] = folder_url
+        
+    # Store the updated data back into the Redis database
+    redis_client.set("folder_urls", json.dumps(existing_folder_urls))
+
+    # Check if the folder already exists within "Automated Zoom Recordings"
+    results = drive_service.files().list(
+        q=f"name='{folder_name}' and '{recordings_folder_id}' in parents and mimeType='application/vnd.google-apps.folder'",
+        fields='files(id)',
+        spaces='drive'
+    ).execute()
+
+    if len(results['files']) > 0:
+        folder_id = results['files'][0]['id']
+    else:
+        # Create the folder within "Automated Zoom Recordings" if it doesn't exist
+        file_metadata = {
+            'name': folder_name,
+            'mimeType': 'application/vnd.google-apps.folder',
+            'parents': [recordings_folder_id]
+        }
+        folder = drive_service.files().create(body=file_metadata, fields='id').execute()
+        folder_id = folder['id']
+
+    for files in recording['recording_files']:
+        start_time = recording['start_time']
+        start_datetime = datetime.strptime(start_time, "%Y-%m-%dT%H:%M:%SZ")
+        date_string = start_datetime.strftime("%Y-%m-%d_%H-%M-%S")  # Updated format
+        video_filename = f"{topics}_{date_string}.mp4"
+        video_filename = video_filename.replace("'", "\\'")  # Escape single quotation mark
+        download_url = files['download_url']
+        
+        if files['status'] == 'completed' and files['file_extension'] == 'MP4' and recording['duration'] >= 10:
+            upload_recording_file(drive_service, files, download_url, video_filename, folder_id)
+
+def upload_recording_file(drive_service, file_info, download_url, video_filename, folder_id):
+    try:
+        # Check if a file with the same name already exists in the folder
+        query = f"name='{video_filename}' and '{folder_id}' in parents"
+        existing_files = drive_service.files().list(
+            q=query,
+            fields='files(id)',
+            spaces='drive'
+        ).execute()
+
+        if len(existing_files['files']) > 0:
+            # File with the same name already exists, skip uploading
+            print(f"Skipping upload of '{video_filename}' as it already exists.")
+            return
+
+        # Use a smaller chunk size for streaming to avoid memory issues
+        chunk_size = 1024 * 1024  # 1MB chunks
+        
+        # Add timeout to prevent hanging downloads
+        response = requests.get(download_url, stream=True, timeout=(30, 300))
+        response.raise_for_status()
+
+        # Capture the video content in a BytesIO object
+        video_content = io.BytesIO()
+        for chunk in response.iter_content(chunk_size=chunk_size):
+            if chunk:
+                video_content.write(chunk)
+
+        # Reset the file pointer to the beginning of the content
+        video_content.seek(0)
+
+        # Upload the video to the folder in Google Drive
+        file_metadata = {
+            'name': video_filename,
+            'parents': [folder_id]
+        }
+        # Use resumable upload for large files
+        media = MediaIoBaseUpload(
+            video_content, 
+            mimetype='video/mp4', 
+            resumable=True,
+            chunksize=chunk_size
+        )
+
+        # Upload with progress monitoring
+        request = drive_service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id'
+        )
+        
+        response = None
+        while response is None:
+            try:
+                # Use smaller chunk for each upload step
+                status, response = request.next_chunk()
+            except Exception as e:
+                print(f"Error during upload for {video_filename}: {str(e)}")
+                # Retry a few times before giving up
+                for retry in range(5):
+                    try:
+                        time.sleep(2 ** retry)  # Exponential backoff
+                        status, response = request.next_chunk()
+                        if response:
+                            break
+                    except Exception as retry_e:
+                        print(f"Retry {retry} failed: {str(retry_e)}")
+                
+                if response is None:
+                    print(f"Failed to upload {video_filename} after retries")
+                    return
+
+        print(f"Successfully uploaded {video_filename}")
+
+    except (ConnectionError, ChunkedEncodingError) as e:
+        print(f"Network error while downloading or uploading recording: {str(e)}")
+        raise
+    except Exception as e:
+        print(f"Error uploading file {video_filename}: {str(e)}")
+        raise
+
 def share_folder_with_email(drive_service, folder_name, email, recordings_folder_id):
     # Check if the folder already exists within "Automated Zoom Recordings"
     results = drive_service.files().list(
