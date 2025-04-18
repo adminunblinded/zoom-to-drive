@@ -1,12 +1,17 @@
 from flask import Flask, redirect, request, Blueprint
 from google_auth_oauthlib.flow import Flow
 from download import download_zoom_recordings
-from tasks import process_single_recording
+from tasks import setup_folders
 import pickle
 import os
 import redis
 import json
 import requests
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 upload_blueprint = Blueprint('upload', __name__)
 upload_blueprint.secret_key = '@unblinded2018'
@@ -56,33 +61,21 @@ def retrieve_parameters():
 def index():
     access_token = redis_client.get('google_access_token')
     if access_token:
-        recordings = download_zoom_recordings()
-        serialized_credentials = redis_client.get('credentials')
-
-        # Ensure credentials exist before proceeding
-        if not serialized_credentials:
-            # Maybe redirect to auth or return an error
-            print("Error: Google credentials not found in Redis.")
-            # Clear potentially stale access token and redirect to re-auth
-            redis_client.delete('google_access_token')
-            return redirect('/') # Redirect to start the auth flow again
-
-        if not recordings:
-             print("No new recordings found to upload.")
-             return "No new recordings found to upload."
-
         try:
-            print(f"Enqueuing {len(recordings)} recording tasks...")
-            # Loop through recordings and enqueue a task for each
-            for recording in recordings:
-                process_single_recording.delay(serialized_credentials, recording)
-            print(f"Successfully enqueued {len(recordings)} tasks.")
-            return "Recording upload tasks have been enqueued successfully."
+            recordings = download_zoom_recordings()
+            if not recordings:
+                return "No recordings found to upload"
+                
+            serialized_credentials = redis_client.get('credentials')
+            if not serialized_credentials:
+                return "Google credentials not found, please authenticate again"
+            
+            # Queue the setup_folders task which will manage the recordings processing
+            setup_folders.delay(serialized_credentials, recordings)
+            return "Recordings processing has started in the background"
         except Exception as e:
-            # Log the exception and return an error message
-            print(f"Error enqueuing upload tasks: {str(e)}")
-            # Consider more specific error handling or user feedback
-            return f"Error starting upload process: {str(e)}"
+            logger.error(f"Error starting upload process: {str(e)}")
+            return f"Error starting upload: {str(e)}"
     else:
         authorization_url, state = flow.authorization_url(
             access_type='offline',
@@ -134,27 +127,20 @@ def upload_callback():
         # Update the existing credentials with the new access token
         credentials.token = new_access_token
 
-        # Re-serialize and store updated credentials
+        # Store the serialized credentials in Redis
         serialized_credentials = pickle.dumps(credentials)
         redis_client.set('credentials', serialized_credentials)
 
-        recordings = download_zoom_recordings()
-
-        if not recordings:
-             print("No new recordings found to upload after auth.")
-             return "Authentication successful. No new recordings found to upload."
-
         try:
-            print(f"Enqueuing {len(recordings)} recording tasks after auth...")
-            # Loop through recordings and enqueue a task for each
-            for recording in recordings:
-                process_single_recording.delay(serialized_credentials, recording)
-            print(f"Successfully enqueued {len(recordings)} tasks after auth.")
-            return "Authentication successful. Recording upload tasks have been enqueued."
+            recordings = download_zoom_recordings()
+            if not recordings:
+                return "No recordings found to upload"
+                
+            # Queue the setup_folders task to start the process
+            setup_folders.delay(serialized_credentials, recordings)
+            return "Recordings processing has started in the background"
         except Exception as e:
-            # Log the exception and return an error message
-            print(f"Error enqueuing upload tasks after auth: {str(e)}")
-            return f"Authentication successful, but failed to start upload process: {str(e)}"
+            logger.error(f"Error starting upload process: {str(e)}")
+            return f"Error starting upload: {str(e)}"
     else:
-        print(f"Failed to refresh access token. Status: {response.status_code}, Body: {response.text}")
         return "Failed to refresh access token"

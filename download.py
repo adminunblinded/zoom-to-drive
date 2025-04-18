@@ -3,6 +3,12 @@ import pytz
 from datetime import datetime, timedelta
 import json
 import redis
+import logging
+from requests.exceptions import ConnectionError, ChunkedEncodingError, Timeout
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 redis_url = 'redis://default:cZwwwfMhMjpiwoBIUoGCJrsrFBowGRrn@redis.railway.internal:6379'
 redis_conn = redis.from_url(redis_url)
@@ -10,8 +16,8 @@ redis_conn = redis.from_url(redis_url)
 def download_zoom_recordings():
     access_token = redis_conn.get('access_token')
     if not access_token:
-        print("Access token not found in session. Please authenticate with Zoom.")
-        return
+        logger.warning("Access token not found in session. Please authenticate with Zoom.")
+        return []
     headers = {"Authorization": "Bearer " + access_token.decode()}
 
     eastern_tz = pytz.timezone('US/Eastern')
@@ -33,25 +39,43 @@ def download_zoom_recordings():
             "page_size": 300,  # Increase the page size to retrieve more recordings per page
             "page_number": 1
         }
+        
+        max_retries = 3
+        retry_count = 0
+        
         while True:
-            response = requests.get(
-                "https://api.zoom.us/v2/accounts/me/recordings",
-                headers=headers,
-                params=params
-            )
-            recordings_json = response.json()
-            all_recordings.extend(recordings_json["meetings"])
-            total_records = recordings_json["total_records"]
-            records_per_page = recordings_json["page_size"]
-            total_pages = total_records // records_per_page
+            try:
+                response = requests.get(
+                    "https://api.zoom.us/v2/accounts/me/recordings",
+                    headers=headers,
+                    params=params,
+                    timeout=(10, 30)  # 10s connect, 30s read timeout
+                )
+                response.raise_for_status()
+                recordings_json = response.json()
+                all_recordings.extend(recordings_json["meetings"])
+                total_records = recordings_json["total_records"]
+                records_per_page = recordings_json["page_size"]
+                total_pages = total_records // records_per_page
 
-            if total_records % records_per_page != 0:
-                total_pages += 1
+                if total_records % records_per_page != 0:
+                    total_pages += 1
 
-            if params["page_number"] >= total_pages:
-                break
+                if params["page_number"] >= total_pages:
+                    break
 
-            params["page_number"] += 1
+                params["page_number"] += 1
+                
+            except (ConnectionError, ChunkedEncodingError, Timeout) as e:
+                retry_count += 1
+                if retry_count >= max_retries:
+                    logger.error(f"Failed to fetch Zoom recordings after {max_retries} attempts: {str(e)}")
+                    break
+                    
+                logger.warning(f"Zoom API request failed (attempt {retry_count}/{max_retries}): {str(e)}")
+                continue
+                
         current_date = prev_date - timedelta(days=1)  # Move to the previous date range
 
+    logger.info(f"Downloaded metadata for {len(all_recordings)} Zoom recordings")
     return all_recordings
