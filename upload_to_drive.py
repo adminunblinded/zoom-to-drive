@@ -63,7 +63,7 @@ def index():
             # Use the most basic form of task invocation
             from tasks import uploadFiles as upload_task_func
             # Call the function directly to avoid Celery machinery
-            upload_task_func.delay(serialized_credentials, recordings)
+            upload_task_func(serialized_credentials, recordings)
             return "Recordings are being uploaded"
         except Exception as e:
             # Log the exception and return an error message
@@ -128,7 +128,7 @@ def upload_callback():
             # Use the most basic form of task invocation
             from tasks import uploadFiles as upload_task_func
             # Call the function directly to avoid Celery machinery
-            upload_task_func.delay(serialized_credentials, recordings)
+            upload_task_func(serialized_credentials, recordings)
             return "Recordings are being uploaded"
         except Exception as e:
             # Log the exception and return an error message
