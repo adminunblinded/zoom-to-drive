@@ -4,6 +4,7 @@ import redis
 import json
 import logging
 import os
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(
@@ -88,3 +89,72 @@ def test():
             return jsonify(share_url)
         except Exception as e:
             return jsonify({"error": str(e)})
+
+@app.route('/uploads/status')
+def uploads_status():
+    """Get current status of uploads"""
+    try:
+        # Get successful uploads
+        successful_uploads = redis_client.get("successful_uploads")
+        uploads_data = {}
+        if successful_uploads:
+            uploads_data = json.loads(successful_uploads)
+        
+        # Get active tasks
+        active_tasks = {}
+        task_key_pattern = "task:*"
+        task_keys = redis_client.keys(task_key_pattern)
+        
+        for key in task_keys:
+            task_data = redis_client.get(key)
+            if task_data:
+                task_id = key.decode().split(":", 1)[1]
+                active_tasks[task_id] = json.loads(task_data)
+        
+        # Get folder URLs
+        folder_urls_data = redis_client.get("folder_urls")
+        folder_urls = {}
+        if folder_urls_data:
+            folder_urls = json.loads(folder_urls_data)
+
+        # Summary statistics
+        upload_count = len(uploads_data)
+        active_task_count = len(active_tasks)
+        
+        return jsonify({
+            "status": "success",
+            "summary": {
+                "total_uploads_completed": upload_count,
+                "active_tasks": active_task_count,
+                "folder_count": len(folder_urls)
+            },
+            "uploads": uploads_data,
+            "active_tasks": active_tasks,
+            "folder_urls": folder_urls
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting upload status: {str(e)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        })
+
+@app.route('/health')
+def health_check():
+    """Simple health check endpoint"""
+    try:
+        # Check Redis connection
+        redis_client.ping()
+        
+        return jsonify({
+            "status": "healthy",
+            "redis": "connected",
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "unhealthy",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }), 500
