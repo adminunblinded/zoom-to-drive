@@ -17,7 +17,6 @@ import logging
 import os
 import backoff
 import sentry_sdk
-import sys
 from sentry_sdk.integrations.celery import CeleryIntegration
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
@@ -39,103 +38,37 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Patch importlib.metadata.entry_points directly to handle API changes
-def patch_entry_points_function():
-    py_version = sys.version_info
-    logger.info(f"Patching entry_points for Python {py_version.major}.{py_version.minor}.{py_version.micro}")
-    
-    # Store the original entry_points function
-    original_entry_points = importlib.metadata.entry_points
-
-    # Define our patched entry_points function
-    def patched_entry_points(group=None):
-        try:
-            eps = original_entry_points()
-            
-            # Different handling based on what entry_points returns
-            if isinstance(eps, dict):
-                # Old-style API (pre-Python 3.10)
-                if group is None:
-                    return eps
-                return eps.get(group, [])
-            
-            # New-style API (Python 3.10+)
-            if hasattr(eps, 'select'):
-                # New API with select method
-                if group is None:
-                    return eps
-                return eps.select(group=group)
-            
-            # Fallback for other return types
-            if group is None:
-                return eps
-                
-            # Manual filtering for newer API
-            return [ep for ep in eps if getattr(ep, 'group', None) == group]
-            
-        except Exception as e:
-            logger.error(f"Error in patched entry_points: {e}")
-            # Return empty list as fallback
-            return []
-    
-    # Apply the patch
-    importlib.metadata.entry_points = patched_entry_points
-    logger.info("Successfully patched importlib.metadata.entry_points")
-
-# Apply the importlib patch first
-patch_entry_points_function()
-
-# Comprehensive patch for EntryPoints issue across Python versions
+# More comprehensive monkey patch for EntryPoints issue in Python 3.12 with Celery
 def patch_celery_entry_points():
     try:
-        # Import the required Celery modules
+        # Direct patch for celery.utils.imports.load_extension_class_names
         from celery.utils import imports
+        original_load_extension = imports.load_extension_class_names
         
-        # Get Python version info
-        py_version = sys.version_info
-        logger.info(f"Python version: {py_version.major}.{py_version.minor}.{py_version.micro}")
-        
-        # Define version-specific patched function
         def patched_load_extension_class_names(namespace):
             try:
-                # Different handling for different Python versions
-                if py_version >= (3, 10):
-                    # Python 3.10+ approach
-                    try:
-                        # First try the new API with select
-                        eps = importlib.metadata.entry_points(group=namespace)
-                        result = {ep.name: ep.value for ep in eps}
-                    except TypeError:
-                        # Fall back to filtering manually if select not available
-                        eps = importlib.metadata.entry_points()
-                        if hasattr(eps, 'select'):  # Python 3.10+
-                            result = {ep.name: ep.value for ep in eps.select(group=namespace)}
-                        else:  # Some versions might have different API
-                            result = {}
-                            for ep in eps:
-                                if getattr(ep, 'group', None) == namespace:
-                                    result[ep.name] = ep.value
-                else:
-                    # Legacy approach for older Python versions
-                    eps = importlib.metadata.entry_points()
-                    if isinstance(eps, dict):  # Old style dict return
-                        result = eps.get(namespace, {})
-                    else:  # Iterable of entry point objects
-                        result = {}
-                        for ep in eps:
-                            if getattr(ep, 'group', None) == namespace:
-                                result[ep.name] = ep.value
-                
-                logger.info(f"Successfully loaded {len(result)} entry points for namespace: {namespace}")
+                eps = importlib.metadata.entry_points()
+                result = {}
+                # Handle different entry_points() return types between Python versions
+                if hasattr(eps, 'select'):  # Python 3.10+ with importlib_metadata >= 3.6.0
+                    selected_eps = eps.select(group=namespace)
+                    for ep in selected_eps:
+                        result[ep.name] = ep.value
+                elif hasattr(eps, 'get'):  # Old style (Python < 3.10)
+                    for ep in eps.get(namespace, []):
+                        result[ep.name] = ep.value
+                else:  # Python 3.10+ with newer importlib.metadata
+                    for ep in eps:
+                        if ep.group == namespace:
+                            result[ep.name] = ep.value
                 return result
             except Exception as e:
                 logger.error(f"EntryPoints patch error: {e}")
-                # Return empty dict on error to prevent failures
                 return {}
-        
-        # Apply the patch
+                
+        # Replace the original function with our patched version
         imports.load_extension_class_names = patched_load_extension_class_names
-        logger.info("Successfully applied EntryPoints patch")
+        logger.info("Successfully applied EntryPoints patch for Celery")
         
     except (ImportError, AttributeError) as e:
         logger.error(f"Failed to apply EntryPoints patch: {e}")
@@ -143,81 +76,41 @@ def patch_celery_entry_points():
 # Apply the patch before Celery is initialized
 patch_celery_entry_points()
 
-# Define Redis URL
 redis_url = os.environ.get('REDIS_URL', 'redis://default:cZwwwfMhMjpiwoBIUoGCJrsrFBowGRrn@redis.railway.internal:6379')
 
-# Safely initialize Celery with fallback options
-def initialize_celery():
-    try:
-        logger.info("Initializing Celery application")
-        app = Celery('tasks')
-        app.conf.update(
-            broker_url=redis_url,
-            result_backend=redis_url,
-            broker_connection_retry=True,
-            broker_connection_retry_on_startup=True,
-            broker_connection_timeout=30,
-            accept_content=['pickle', 'json'],
-            task_serializer='pickle',
-            result_serializer='pickle',
-            worker_proc_alive_timeout=180.0,  # Increased from 120 to 180 seconds
-            task_ignore_result=False,  # Enable result tracking for monitoring
-            task_store_errors_even_if_ignored=True,
-            task_track_started=True,
-            task_time_limit=1800,  # 30 minutes
-            worker_hijack_root_logger=False,
-            worker_max_tasks_per_child=5,  # Reduced from 10 to 5 for better memory management
-            broker_heartbeat=10,
-            broker_pool_limit=5,
-            worker_concurrency=4,  # Set number of worker processes
-            worker_prefetch_multiplier=1,  # Process one task at a time per worker
-            task_acks_late=True,  # Only acknowledge tasks after they're completed
-            task_create_missing_queues=True,
-            task_default_queue='default',
-            worker_pool='gevent',  # Use gevent pool for non-blocking I/O
-            worker_pool_restarts=True,
-            task_routes={
-                'tasks.setup_folders': {'queue': 'setup'},
-                'tasks.upload_recording': {'queue': 'upload'},
-                'tasks.process_file': {'queue': 'process'},
-            }
-        )
-        return app
-    except Exception as e:
-        logger.error(f"Error initializing Celery with all options: {str(e)}")
-        
-        # Try with minimal configuration as fallback
-        try:
-            logger.info("Trying fallback Celery initialization")
-            app = Celery('tasks')
-            app.conf.update(
-                broker_url=redis_url,
-                result_backend=redis_url,
-                broker_connection_retry=True,
-                broker_connection_timeout=30,
-                task_serializer='json',  # Use JSON for safer serialization
-                result_serializer='json',
-                accept_content=['json'],
-                worker_pool='solo',  # Use simpler pool as fallback
-            )
-            logger.info("Successfully initialized Celery with fallback options")
-            return app
-        except Exception as e2:
-            logger.critical(f"Critical error initializing Celery: {str(e2)}")
-            raise
-
-# Initialize Celery with safe initialization
-try:
-    celery = initialize_celery()
-    logger.info("Celery initialization successful")
-except Exception as e:
-    logger.critical(f"Failed to initialize Celery: {str(e)}")
-    # Create minimal Celery instance that at least allows the app to start
-    celery = Celery('tasks', broker=redis_url)
-    logger.warning("Using minimal Celery configuration due to initialization failure")
-
-# Initialize Redis client with retry
-redis_client = redis.from_url(redis_url, socket_timeout=10)
+# Initialize Celery with explicit broker and backend for task status tracking
+celery = Celery('tasks')
+celery.conf.update(
+    broker_url=redis_url,
+    result_backend=redis_url,
+    broker_connection_retry=True,
+    broker_connection_retry_on_startup=True,
+    broker_connection_timeout=30,
+    accept_content=['pickle', 'json'],
+    task_serializer='pickle',
+    result_serializer='pickle',
+    worker_proc_alive_timeout=180.0,  # Increased from 120 to 180 seconds
+    task_ignore_result=False,  # Enable result tracking for monitoring
+    task_store_errors_even_if_ignored=True,
+    task_track_started=True,
+    task_time_limit=1800,  # 30 minutes
+    worker_hijack_root_logger=False,
+    worker_max_tasks_per_child=5,  # Reduced from 10 to 5 for better memory management
+    broker_heartbeat=10,
+    broker_pool_limit=5,
+    worker_concurrency=4,  # Set number of worker processes
+    worker_prefetch_multiplier=1,  # Process one task at a time per worker
+    task_acks_late=True,  # Only acknowledge tasks after they're completed
+    task_create_missing_queues=True,
+    task_default_queue='default',
+    worker_pool='gevent',  # Use gevent pool for non-blocking I/O
+    worker_pool_restarts=True,
+    task_routes={
+        'tasks.setup_folders': {'queue': 'setup'},
+        'tasks.upload_recording': {'queue': 'upload'},
+        'tasks.process_file': {'queue': 'process'},
+    }
+)
 
 # Register Celery signals for better monitoring
 @signals.task_failure.connect
@@ -232,39 +125,7 @@ def task_success_handler(sender=None, **kwargs):
 def worker_ready_handler(**kwargs):
     logger.info("Worker is ready to receive tasks")
 
-# Utility function to get task status even if Celery has issues
-def get_task_status_from_redis(task_id):
-    """
-    Get task status directly from Redis, as a fallback mechanism
-    when Celery's AsyncResult might not be working properly
-    """
-    if not task_id:
-        return {'status': 'error', 'message': 'No task ID provided'}
-        
-    try:
-        # First try to get status from Redis
-        task_info_json = redis_client.get(f"task:{task_id}")
-        if task_info_json:
-            task_info = json.loads(task_info_json)
-            return task_info
-            
-        # If not in Redis, try to get from Celery
-        try:
-            task = celery.AsyncResult(task_id)
-            if task.state:
-                return {
-                    'task_id': task_id,
-                    'status': task.state,
-                    'info': str(task.info) if task.info else None
-                }
-        except Exception as e:
-            logger.warning(f"Could not get task status from Celery: {str(e)}")
-            
-        # Default response if not found
-        return {'status': 'unknown', 'task_id': task_id}
-    except Exception as e:
-        logger.error(f"Error retrieving task status from Redis: {str(e)}")
-        return {'status': 'error', 'message': str(e)}
+redis_client = redis.from_url(redis_url, socket_timeout=10)
 
 # Separate task to handle folder creation and sharing
 @celery.task(

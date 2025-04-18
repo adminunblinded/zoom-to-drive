@@ -5,6 +5,7 @@ import json
 import redis
 import logging
 import os
+import importlib.metadata
 from requests.exceptions import ConnectionError, ChunkedEncodingError, Timeout
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import time
@@ -17,6 +18,42 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# Patch for Celery EntryPoints issue in Python 3.10+
+def patch_celery_entry_points():
+    try:
+        from celery.utils import imports
+        
+        def patched_load_extension_class_names(namespace):
+            try:
+                eps = importlib.metadata.entry_points()
+                result = {}
+                # Handle different entry_points() return types between Python versions
+                if hasattr(eps, 'select'):  # Python 3.10+ with importlib_metadata >= 3.6.0
+                    selected_eps = eps.select(group=namespace)
+                    for ep in selected_eps:
+                        result[ep.name] = ep.value
+                elif hasattr(eps, 'get'):  # Old style (Python < 3.10)
+                    for ep in eps.get(namespace, []):
+                        result[ep.name] = ep.value
+                else:  # Python 3.10+ with newer importlib.metadata
+                    for ep in eps:
+                        if ep.group == namespace:
+                            result[ep.name] = ep.value
+                return result
+            except Exception as e:
+                logger.error(f"EntryPoints patch error: {e}")
+                return {}
+                
+        # Replace the original function
+        imports.load_extension_class_names = patched_load_extension_class_names
+        logger.info("Successfully applied EntryPoints patch for Celery in download.py")
+        
+    except (ImportError, AttributeError) as e:
+        logger.error(f"Failed to apply EntryPoints patch: {e}")
+
+# Apply the patch before any Celery imports might happen
+patch_celery_entry_points()
 
 # Use environment variable or default
 redis_url = os.environ.get('REDIS_URL', 'redis://default:cZwwwfMhMjpiwoBIUoGCJrsrFBowGRrn@redis.railway.internal:6379')
@@ -40,7 +77,7 @@ def fetch_zoom_recordings_page(headers, params):
     return response.json()
 
 def download_zoom_recordings():
-    """Download metadata for Zoom recordings from the past 6 months"""
+    """Download metadata for Zoom recordings from the past 7 days"""
     start_time = time.time()
     logger.info("Starting Zoom recordings download")
     
@@ -54,7 +91,7 @@ def download_zoom_recordings():
     eastern_tz = pytz.timezone('US/Eastern')
     
     end_date = datetime.now(eastern_tz)
-    start_date = end_date - timedelta(days=2)  # Fetch recordings from the past 6 months
+    start_date = end_date - timedelta(days=7)  # Fetch recordings from the past 7 days
     
     all_recordings = []
     current_date = end_date

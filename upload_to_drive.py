@@ -1,7 +1,5 @@
 from flask import Flask, redirect, request, Blueprint, jsonify
 from google_auth_oauthlib.flow import Flow
-from download import download_zoom_recordings
-from tasks import setup_folders
 import pickle
 import os
 import redis
@@ -9,6 +7,7 @@ import json
 import requests
 import logging
 import time
+import importlib.metadata
 from datetime import datetime
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from requests.exceptions import ConnectionError, ChunkedEncodingError, Timeout
@@ -20,6 +19,46 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# Patch for Celery EntryPoints issue in Python 3.10+
+def patch_celery_entry_points():
+    try:
+        from celery.utils import imports
+        
+        def patched_load_extension_class_names(namespace):
+            try:
+                eps = importlib.metadata.entry_points()
+                result = {}
+                # Handle different entry_points() return types between Python versions
+                if hasattr(eps, 'select'):  # Python 3.10+ with importlib_metadata >= 3.6.0
+                    selected_eps = eps.select(group=namespace)
+                    for ep in selected_eps:
+                        result[ep.name] = ep.value
+                elif hasattr(eps, 'get'):  # Old style (Python < 3.10)
+                    for ep in eps.get(namespace, []):
+                        result[ep.name] = ep.value
+                else:  # Python 3.10+ with newer importlib.metadata
+                    for ep in eps:
+                        if ep.group == namespace:
+                            result[ep.name] = ep.value
+                return result
+            except Exception as e:
+                logger.error(f"EntryPoints patch error: {e}")
+                return {}
+                
+        # Replace the original function
+        imports.load_extension_class_names = patched_load_extension_class_names
+        logger.info("Successfully applied EntryPoints patch for Celery in upload_to_drive.py")
+        
+    except (ImportError, AttributeError) as e:
+        logger.error(f"Failed to apply EntryPoints patch: {e}")
+
+# Apply the patch before importing Celery-dependent modules
+patch_celery_entry_points()
+
+# Import modules that depend on Celery after the patch
+from download import download_zoom_recordings
+from tasks import setup_folders
 
 upload_blueprint = Blueprint('upload', __name__)
 upload_blueprint.secret_key = '@unblinded2018'
@@ -96,99 +135,67 @@ def index():
     """Main upload route - starts the Zoom to Drive transfer process"""
     logger.info("Upload process initiated")
     
-    try:
-        access_token = redis_client.get('google_access_token')
-        if access_token:
-            try:
-                # Get recordings from Zoom
-                logger.info("Fetching Zoom recordings")
-                recordings = download_zoom_recordings()
-                if not recordings:
-                    logger.warning("No recordings found to upload")
-                    return "No recordings found to upload"
-                    
-                serialized_credentials = redis_client.get('credentials')
-                if not serialized_credentials:
-                    logger.error("Google credentials not found")
-                    return "Google credentials not found, please authenticate again"
+    access_token = redis_client.get('google_access_token')
+    if access_token:
+        try:
+            # Get recordings from Zoom
+            logger.info("Fetching Zoom recordings")
+            recordings = download_zoom_recordings()
+            if not recordings:
+                logger.warning("No recordings found to upload")
+                return "No recordings found to upload"
                 
-                # Start the folder setup and processing pipeline with better error handling
-                try:
-                    # Import with try/except to handle potential import issues
-                    from tasks import setup_folders
-                    
-                    # Start the task
-                    task = setup_folders.delay(serialized_credentials, recordings)
-                    task_id = task.id
-                    
-                    # Store task info in Redis for status tracking
-                    task_info = {
-                        'task_id': task_id,
-                        'status': 'STARTED',
-                        'recordings_count': len(recordings),
-                        'start_time': datetime.now().isoformat(),
-                    }
-                    redis_client.set(f"task:{task_id}", json.dumps(task_info))
-                    
-                    logger.info(f"Started processing with task ID: {task_id} for {len(recordings)} recordings")
-                    return jsonify({
-                        'status': 'success', 
-                        'message': f"Processing started with task ID: {task_id}",
-                        'task_id': task_id,
-                        'recordings_count': len(recordings)
-                    })
-                except ImportError as ie:
-                    # Handle Celery import error
-                    logger.error(f"Celery task import error: {str(ie)}", exc_info=True)
-                    return jsonify({
-                        'status': 'error',
-                        'message': f"System error: Unable to start processing (Celery task error). Contact administrator."
-                    })
-                except ConnectionError as ce:
-                    # Handle Redis connection error
-                    logger.error(f"Redis connection error: {str(ce)}", exc_info=True)
-                    return jsonify({
-                        'status': 'error',
-                        'message': f"System error: Unable to connect to task queue. Try again later."
-                    })
-                
-            except Exception as e:
-                logger.error(f"Error starting upload process: {str(e)}", exc_info=True)
-                return jsonify({
-                    'status': 'error',
-                    'message': f"Error starting upload: {str(e)}"
-                })
-        else:
-            # Need to authenticate with Google first
-            logger.info("Google authentication required - redirecting to OAuth flow")
-            try:
-                authorization_url, state = flow.authorization_url(
-                    access_type='offline',
-                    include_granted_scopes='true',
-                    prompt='consent'
-                )
-                # Store the state in Redis
-                redis_client.set('oauth_state', state)
-                logger.info("Redirecting to Google OAuth")
-                return redirect(authorization_url)
-            except Exception as e:
-                logger.error(f"Error during OAuth initialization: {str(e)}", exc_info=True)
-                return jsonify({
-                    'status': 'error',
-                    'message': f"Authentication error: {str(e)}"
-                })
-    except redis.RedisError as re:
-        logger.error(f"Redis connection error: {str(re)}", exc_info=True)
-        return jsonify({
-            'status': 'error',
-            'message': "Database connection error. Please try again later."
-        })
-    except Exception as e:
-        logger.error(f"Unexpected error in upload process: {str(e)}", exc_info=True)
-        return jsonify({
-            'status': 'error',
-            'message': f"Unexpected error: {str(e)}"
-        })
+            serialized_credentials = redis_client.get('credentials')
+            if not serialized_credentials:
+                logger.error("Google credentials not found")
+                return "Google credentials not found, please authenticate again"
+            
+            # Start the folder setup and processing pipeline
+            task = setup_folders.delay(serialized_credentials, recordings)
+            task_id = task.id
+            
+            # Store task info in Redis for status tracking
+            task_info = {
+                'task_id': task_id,
+                'status': 'STARTED',
+                'recordings_count': len(recordings),
+                'start_time': datetime.now().isoformat(),
+            }
+            redis_client.set(f"task:{task_id}", json.dumps(task_info))
+            
+            logger.info(f"Started processing with task ID: {task_id} for {len(recordings)} recordings")
+            return jsonify({
+                'status': 'success', 
+                'message': f"Processing started with task ID: {task_id}",
+                'task_id': task_id,
+                'recordings_count': len(recordings)
+            })
+            
+        except Exception as e:
+            logger.error(f"Error starting upload process: {str(e)}", exc_info=True)
+            return jsonify({
+                'status': 'error',
+                'message': f"Error starting upload: {str(e)}"
+            })
+    else:
+        # Need to authenticate with Google first
+        logger.info("Google authentication required - redirecting to OAuth flow")
+        try:
+            authorization_url, state = flow.authorization_url(
+                access_type='offline',
+                include_granted_scopes='true',
+                prompt='consent'
+            )
+            # Store the state in Redis
+            redis_client.set('oauth_state', state)
+            logger.info("Redirecting to Google OAuth")
+            return redirect(authorization_url)
+        except Exception as e:
+            logger.error(f"Error during OAuth initialization: {str(e)}", exc_info=True)
+            return jsonify({
+                'status': 'error',
+                'message': f"Authentication error: {str(e)}"
+            })
 
 @upload_blueprint.route('/upload_callback')
 def upload_callback():
@@ -228,33 +235,21 @@ def upload_callback():
                 logger.warning("No recordings found to upload after authentication")
                 return "Authentication successful but no recordings found to upload"
             
-            # Start processing with better error handling
-            try:
-                # Import with try/except to handle potential import issues
-                from tasks import setup_folders
-                
-                # Start the task
-                task = setup_folders.delay(serialized_credentials, recordings)
-                task_id = task.id
-                
-                # Store task info
-                task_info = {
-                    'task_id': task_id,
-                    'status': 'STARTED',
-                    'recordings_count': len(recordings),
-                    'start_time': datetime.now().isoformat(),
-                }
-                redis_client.set(f"task:{task_id}", json.dumps(task_info))
-                
-                logger.info(f"Started processing with task ID: {task_id} for {len(recordings)} recordings")
-                return f"Authentication successful. Processing {len(recordings)} recordings with task ID: {task_id}"
-            except ImportError as ie:
-                # Handle Celery/tasks import errors
-                logger.error(f"Task import error after authentication: {str(ie)}", exc_info=True)
-                return "Authentication successful, but there was a system error starting the processing. Please try again or contact support."
-            except Exception as e:
-                logger.error(f"Task startup error after authentication: {str(e)}", exc_info=True)
-                return f"Authentication successful, but error starting processing: {str(e)}"
+            # Start processing
+            task = setup_folders.delay(serialized_credentials, recordings)
+            task_id = task.id
+            
+            # Store task info
+            task_info = {
+                'task_id': task_id,
+                'status': 'STARTED',
+                'recordings_count': len(recordings),
+                'start_time': datetime.now().isoformat(),
+            }
+            redis_client.set(f"task:{task_id}", json.dumps(task_info))
+            
+            logger.info(f"Started processing with task ID: {task_id} for {len(recordings)} recordings")
+            return f"Authentication successful. Processing {len(recordings)} recordings with task ID: {task_id}"
             
         except Exception as e:
             logger.error(f"Error starting processing after authentication: {str(e)}", exc_info=True)
@@ -268,57 +263,21 @@ def upload_callback():
 def task_status(task_id):
     """Check the status of a processing task"""
     try:
-        # First try using our utility function
-        from tasks import get_task_status_from_redis
-        
-        status_info = get_task_status_from_redis(task_id)
-        if status_info:
-            return jsonify(status_info)
-        
-        # Fall back to the original implementation if utility function fails
         task_info_json = redis_client.get(f"task:{task_id}")
         if task_info_json:
             task_info = json.loads(task_info_json)
             return jsonify(task_info)
         else:
             # Try to get info from Celery
-            try:
-                from tasks import celery
-                task = celery.AsyncResult(task_id)
-                if task.state:
-                    return jsonify({
-                        'task_id': task_id,
-                        'status': task.state,
-                        'info': str(task.info) if task.info else None
-                    })
-            except ImportError:
-                logger.warning("Could not import Celery to check task status")
-            except Exception as e:
-                logger.warning(f"Error checking Celery task status: {str(e)}")
-                
+            from tasks import celery
+            task = celery.AsyncResult(task_id)
+            if task.state:
+                return jsonify({
+                    'task_id': task_id,
+                    'status': task.state,
+                    'info': str(task.info) if task.info else None
+                })
             return jsonify({'status': 'not_found'})
-    except ImportError:
-        logger.warning("Could not import task status utility")
-        # Fall back to original implementation
-        try:
-            task_info_json = redis_client.get(f"task:{task_id}")
-            if task_info_json:
-                task_info = json.loads(task_info_json)
-                return jsonify(task_info)
-            else:
-                # Try to get info from Celery
-                from tasks import celery
-                task = celery.AsyncResult(task_id)
-                if task.state:
-                    return jsonify({
-                        'task_id': task_id,
-                        'status': task.state,
-                        'info': str(task.info) if task.info else None
-                    })
-                return jsonify({'status': 'not_found'})
-        except Exception as e:
-            logger.error(f"Error checking task status: {str(e)}")
-            return jsonify({'status': 'error', 'message': str(e)})
     except Exception as e:
         logger.error(f"Error checking task status: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)})
