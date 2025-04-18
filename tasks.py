@@ -772,3 +772,389 @@ def update_task_status(task_id, status, message=None):
         logger.info(f"Updated task {task_id} status: {status} - {message}")
     except Exception as e:
         logger.error(f"Error updating task status: {str(e)}")
+
+# Add synchronous versions of the processing functions for use when Celery workers aren't available
+def setup_folders_sync(serialized_credentials, recordings):
+    """Synchronous version of setup_folders for direct execution"""
+    logger.info(f"Starting synchronous setup_folders with {len(recordings)} recordings")
+    
+    try:
+        # Update an in-memory status
+        status = {
+            "status": "PROCESSING_FOLDERS",
+            "message": f"Setting up folders for {len(recordings)} recordings",
+            "start_time": datetime.now().isoformat()
+        }
+        
+        credentials = pickle.loads(serialized_credentials)
+        API_VERSION = 'v3'
+        
+        # Verify credentials are valid and not expired
+        if not credentials or not credentials.valid:
+            logger.error("Invalid or expired credentials in synchronous setup_folders")
+            status["status"] = "ERROR"
+            status["message"] = "Invalid or expired credentials"
+            return status
+            
+        # Test token by making a small API call
+        try:
+            test_service = build('drive', API_VERSION, credentials=credentials, cache_discovery=False)
+            test_about = test_service.about().get(fields="user").execute()
+            user_email = test_about.get("user", {}).get("emailAddress")
+            logger.info(f"Successfully connected to Google Drive as {user_email}")
+        except Exception as e:
+            logger.error(f"Failed to connect to Google Drive API: {str(e)}")
+            status["status"] = "ERROR"
+            status["message"] = f"Failed to connect to Google Drive: {str(e)}"
+            return status
+        
+        # Build drive service
+        drive_service = build(
+            'drive', 
+            API_VERSION, 
+            credentials=credentials,
+            cache_discovery=False
+        )
+
+        # Check if the "Automated Zoom Recordings" folder already exists
+        results = drive_service.files().list(
+            q="name='Automated Zoom Recordings' and mimeType='application/vnd.google-apps.folder'",
+            fields='files(id)',
+            spaces='drive'
+        ).execute()
+
+        if len(results['files']) > 0:
+            recordings_folder_id = results['files'][0]['id']
+            logger.info(f"Found existing Automated Zoom Recordings folder: {recordings_folder_id}")
+        else:
+            # Create the main folder if it doesn't exist
+            file_metadata = {
+                'name': 'Automated Zoom Recordings',
+                'mimeType': 'application/vnd.google-apps.folder'
+            }
+            recordings_folder = drive_service.files().create(body=file_metadata, fields='id').execute()
+            recordings_folder_id = recordings_folder['id']
+            logger.info(f"Created new Automated Zoom Recordings folder: {recordings_folder_id}")
+        
+        # Store folder IDs for each recording topic
+        folder_ids = {}
+        
+        # Process recordings in smaller batches to avoid timeouts
+        batch_size = 10
+        for i in range(0, len(recordings), batch_size):
+            batch = recordings[i:i+batch_size]
+            logger.info(f"Processing batch {i//batch_size + 1} with {len(batch)} recordings")
+            
+            for recording in batch:
+                topics = recording['topic']
+                folder_name = topics.replace(" ", "_")
+                folder_name = folder_name.replace("'", "\\'")
+                
+                # Get existing folder URLs
+                try:
+                    folder_urls_data = redis_client.get("folder_urls")
+                    if folder_urls_data:
+                        existing_folder_urls = json.loads(folder_urls_data)
+                    else:
+                        existing_folder_urls = {}
+                        
+                    # Get stored parameters
+                    stored_params_data = redis_client.get("stored_params")
+                    if stored_params_data:
+                        stored_params = json.loads(stored_params_data)
+                    else:
+                        stored_params = {}
+                    
+                    # Check for account names in the topic
+                    for accountName, email in stored_params.items():
+                        if accountName and email:
+                            if accountName in topics and accountName not in existing_folder_urls:
+                                # Share folder with the email
+                                folder_url = share_folder_with_email(drive_service, folder_name, email, recordings_folder_id)
+                                existing_folder_urls[accountName] = folder_url
+                                logger.info(f"Shared folder {folder_name} with {email}")
+                    
+                    # Save updated folder URLs
+                    redis_client.set("folder_urls", json.dumps(existing_folder_urls))
+                except Exception as e:
+                    logger.warning(f"Error processing folder sharing: {str(e)}")
+                    # Continue with the task, don't fail if sharing has issues
+
+                # Check if folder exists
+                results = drive_service.files().list(
+                    q=f"name='{folder_name}' and '{recordings_folder_id}' in parents and mimeType='application/vnd.google-apps.folder'",
+                    fields='files(id)',
+                    spaces='drive'
+                ).execute()
+
+                if len(results['files']) > 0:
+                    folder_id = results['files'][0]['id']
+                else:
+                    # Create folder if it doesn't exist
+                    file_metadata = {
+                        'name': folder_name,
+                        'mimeType': 'application/vnd.google-apps.folder',
+                        'parents': [recordings_folder_id]
+                    }
+                    folder = drive_service.files().create(body=file_metadata, fields='id').execute()
+                    folder_id = folder['id']
+                    logger.info(f"Created new folder: {folder_name} with ID: {folder_id}")
+                
+                folder_ids[topics] = folder_id
+                
+                # Process files for this recording synchronously
+                process_recording_sync(serialized_credentials, recording, recordings_folder_id, folder_id)
+                
+            # Pause briefly between batches to avoid API rate limits
+            time.sleep(1)
+            
+        # Save folder IDs to Redis
+        redis_client.set("folder_ids", json.dumps(folder_ids))
+        logger.info(f"Saved {len(folder_ids)} folder IDs to Redis")
+        
+        # Update final status
+        status["status"] = "COMPLETED"
+        status["message"] = f"Successfully processed {len(recordings)} recordings"
+        status["end_time"] = datetime.now().isoformat()
+        status["folder_ids"] = list(folder_ids.values())
+        
+        return status
+            
+    except Exception as e:
+        logger.error(f"Error in synchronous setup_folders: {str(e)}", exc_info=True)
+        return {
+            "status": "ERROR",
+            "message": f"Error in synchronous processing: {str(e)}",
+            "time": datetime.now().isoformat()
+        }
+
+def process_recording_sync(serialized_credentials, recording, recordings_folder_id, folder_id):
+    """Process a recording synchronously"""
+    recording_topic = recording.get('topic', 'Unknown')
+    recording_id = recording.get('uuid', 'Unknown')
+    
+    logger.info(f"Processing recording synchronously: '{recording_topic}' (ID: {recording_id})")
+    
+    try:
+        credentials = pickle.loads(serialized_credentials)
+        
+        # Verify credentials are valid
+        if not credentials or not credentials.valid:
+            logger.error(f"Invalid or expired credentials when processing recording '{recording_topic}'")
+            return {
+                "status": "ERROR",
+                "message": "Invalid credentials"
+            }
+        
+        # Count valid files for processing
+        valid_files = [
+            f for f in recording['recording_files'] 
+            if f['status'] == 'completed' and f['file_extension'] == 'MP4' and recording['duration'] >= 10
+        ]
+        
+        if not valid_files:
+            logger.warning(f"No valid files found for recording '{recording_topic}'")
+            return {
+                "status": "COMPLETED",
+                "message": f"No valid files for recording: {recording_topic}"
+            }
+        
+        logger.info(f"Processing {len(valid_files)} valid files for recording '{recording_topic}'")
+        
+        # Process each file individually
+        processed_files = []
+        for file_data in valid_files:
+            result = process_file_sync(serialized_credentials, recording, file_data, folder_id)
+            processed_files.append(result)
+            
+        return {
+            "status": "COMPLETED",
+            "message": f"Processed {len(processed_files)} files for recording: {recording_topic}",
+            "files": processed_files
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing recording '{recording_topic}': {str(e)}")
+        return {
+            "status": "ERROR",
+            "message": f"Error processing recording: {str(e)}"
+        }
+
+def process_file_sync(serialized_credentials, recording, file_data, folder_id):
+    """Process a single file synchronously"""
+    file_id = file_data.get('id', 'Unknown')
+    topics = recording.get('topic', 'Unknown')
+    
+    logger.info(f"Processing file synchronously: {file_id} from '{topics}'")
+    
+    try:
+        # Skip non-video files or short recordings
+        if file_data['status'] != 'completed' or file_data['file_extension'] != 'MP4' or recording['duration'] < 10:
+            logger.info(f"Skipping file {file_id} - not a completed MP4 or too short")
+            return {
+                "status": "SKIPPED",
+                "message": "Not a valid video file",
+                "file_id": file_id
+            }
+            
+        credentials = pickle.loads(serialized_credentials)
+        
+        # Verify credentials are valid
+        if not credentials or not credentials.valid:
+            logger.error(f"Invalid or expired credentials when processing file {file_id}")
+            return {
+                "status": "ERROR",
+                "message": "Invalid credentials",
+                "file_id": file_id
+            }
+        
+        API_VERSION = 'v3'
+        drive_service = build('drive', API_VERSION, credentials=credentials, cache_discovery=False)
+        
+        start_time = recording['start_time']
+        start_datetime = datetime.strptime(start_time, "%Y-%m-%dT%H:%M:%SZ")
+        date_string = start_datetime.strftime("%Y-%m-%d_%H-%M-%S")
+        video_filename = f"{topics}_{date_string}.mp4"
+        video_filename = video_filename.replace("'", "\\'")
+        download_url = file_data['download_url']
+        
+        # Check if file already exists
+        query = f"name='{video_filename}' and '{folder_id}' in parents"
+        existing_files = drive_service.files().list(
+            q=query,
+            fields='files(id)',
+            spaces='drive'
+        ).execute()
+
+        if len(existing_files['files']) > 0:
+            logger.info(f"Skipping upload of '{video_filename}' as it already exists in Drive")
+            return {
+                "status": "SKIPPED_EXISTS",
+                "message": f"File already exists: {video_filename}",
+                "file_id": file_id
+            }
+            
+        logger.info(f"Downloading and uploading file: {video_filename}")
+        
+        # Download and upload the file
+        result = download_and_upload_file_sync(drive_service, download_url, video_filename, folder_id)
+        
+        logger.info(f"Successfully processed file {file_id}: {result}")
+        return {
+            "status": "COMPLETED",
+            "message": f"Successfully uploaded: {video_filename}",
+            "file_id": file_id,
+            "drive_file_id": result.get("drive_file_id")
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing file {file_id}: {str(e)}")
+        return {
+            "status": "ERROR",
+            "message": f"Error processing file: {str(e)}",
+            "file_id": file_id
+        }
+
+def download_and_upload_file_sync(drive_service, download_url, video_filename, folder_id):
+    """Download and upload a file synchronously"""
+    chunk_size = 1024 * 1024  # 1MB chunks
+    
+    try:
+        logger.info(f"Starting download of {video_filename}")
+        start_time = time.time()
+        
+        # Download file with retry
+        response = download_with_retry(download_url)
+        
+        # Track file size for logging
+        content_length = int(response.headers.get('content-length', 0))
+        
+        # Capture video in memory buffer
+        video_content = io.BytesIO()
+        bytes_downloaded = 0
+        
+        for chunk in response.iter_content(chunk_size=chunk_size):
+            if chunk:
+                video_content.write(chunk)
+                bytes_downloaded += len(chunk)
+                
+                # Log progress for large files
+                if content_length > 50 * 1024 * 1024 and bytes_downloaded % (20 * 1024 * 1024) == 0:  # Log every 20MB
+                    percent = (bytes_downloaded / content_length) * 100 if content_length else 0
+                    logger.info(f"Downloaded {bytes_downloaded/(1024*1024):.1f}MB of {video_filename} ({percent:.1f}%)")
+                
+                # Brief pause every 10MB to prevent timeouts
+                if bytes_downloaded % (10 * chunk_size) == 0:
+                    time.sleep(0.1)
+        
+        download_time = time.time() - start_time
+        logger.info(f"Downloaded {bytes_downloaded/(1024*1024):.1f}MB in {download_time:.2f}s ({bytes_downloaded/download_time/1024/1024:.2f}MB/s)")
+        
+        # Reset file pointer for upload
+        video_content.seek(0)
+        
+        logger.info(f"Starting upload of {video_filename} to Google Drive")
+        upload_start_time = time.time()
+        
+        # Upload to Google Drive
+        file_metadata = {
+            'name': video_filename,
+            'parents': [folder_id]
+        }
+        
+        # Use resumable upload with appropriate chunk size
+        media = MediaIoBaseUpload(
+            video_content, 
+            mimetype='video/mp4', 
+            resumable=True,
+            chunksize=chunk_size
+        )
+        
+        # Create and execute the upload request
+        request = drive_service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id'
+        )
+        
+        # Process the upload in chunks with exponential backoff for errors
+        response = None
+        backoff = 1
+        retries = 0
+        max_retries = 10
+        
+        while response is None and retries < max_retries:
+            try:
+                status, response = request.next_chunk()
+                if status:
+                    progress = int(status.progress() * 100)
+                    # Only log every 20% for large files
+                    if progress % 20 == 0:
+                        logger.info(f"Uploaded {progress}% of {video_filename}")
+                        
+            except Exception as e:
+                retries += 1
+                if retries >= max_retries:
+                    raise Exception(f"Failed to upload {video_filename} after {max_retries} retries: {str(e)}")
+                
+                logger.warning(f"Upload error, attempt {retries}/{max_retries}, retrying in {backoff}s: {str(e)}")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)  # Cap backoff at 60 seconds
+        
+        upload_time = time.time() - upload_start_time
+        file_id = response.get('id', 'unknown')
+        
+        logger.info(f"Successfully uploaded {video_filename} to Google Drive in {upload_time:.2f}s, file ID: {file_id}")
+        
+        return {
+            "status": "success",
+            "message": f"Successfully uploaded {video_filename}",
+            "drive_file_id": file_id,
+            "download_time": download_time,
+            "upload_time": upload_time,
+            "file_size_mb": bytes_downloaded/(1024*1024)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in download_and_upload_file_sync for {video_filename}: {str(e)}")
+        raise

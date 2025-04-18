@@ -4,6 +4,9 @@ import redis
 import json
 import logging
 import os
+import sys
+import threading
+import time
 from datetime import datetime
 
 # Configure logging
@@ -61,6 +64,9 @@ redis_client = redis.from_url(redis_url)
 # Create Flask app
 app = Flask(__name__)
 app.secret_key = '@unblinded2018'
+
+# Set environment variable for app start time
+os.environ['APP_STARTUP_TIME'] = datetime.now().isoformat()
 
 # Register blueprints
 app.register_blueprint(zoom_blueprint)
@@ -157,3 +163,103 @@ def debug_info():
     except Exception as e:
         logger.error(f"Error in debug endpoint: {str(e)}", exc_info=True)
         return jsonify({"error": str(e)})
+
+def start_celery_worker():
+    """Start a Celery worker in a separate thread"""
+    logger.info("Starting Celery worker thread...")
+    from tasks import celery
+    
+    # Configure worker
+    worker_args = [
+        'worker',
+        '--loglevel=INFO',
+        '--concurrency=2',
+        '-Q', 'setup,upload,process',  # Listen to all queues
+        '--without-heartbeat',
+        '--without-gossip',
+        '--without-mingle'
+    ]
+    
+    try:
+        # Monkey patch the worker to run in a thread
+        from threading import Thread
+        
+        class CeleryWorkerThread(Thread):
+            def run(self):
+                try:
+                    logger.info("Celery worker thread started")
+                    celery.worker_main(worker_args)
+                except Exception as e:
+                    logger.error(f"Celery worker thread error: {str(e)}", exc_info=True)
+        
+        # Start the worker thread
+        worker_thread = CeleryWorkerThread()
+        worker_thread.daemon = True  # Allow the thread to exit when the main program exits
+        worker_thread.start()
+        logger.info("Celery worker thread initialized")
+        
+        # Set a flag to indicate the worker is running
+        app.config['CELERY_WORKER_RUNNING'] = True
+        
+    except Exception as e:
+        logger.error(f"Failed to start Celery worker thread: {str(e)}", exc_info=True)
+        app.config['CELERY_WORKER_RUNNING'] = False
+
+# Check command line arguments for worker option
+if __name__ == '__main__':
+    # Check if we should start a worker
+    if len(sys.argv) > 1 and sys.argv[1] == '--with-worker':
+        # Start a Celery worker in a separate thread
+        start_celery_worker()
+        logger.info("Application started with embedded Celery worker")
+    else:
+        logger.info("Application started without embedded Celery worker")
+        
+    # Start the Flask app
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
+else:
+    # When running under gunicorn, check for the ENABLE_WORKER env var
+    if os.environ.get('ENABLE_WORKER', 'false').lower() == 'true':
+        # Start a Celery worker in a separate thread with a delay
+        def delayed_worker_start():
+            time.sleep(5)  # Wait for the app to fully initialize
+            start_celery_worker()
+            
+        threading.Thread(target=delayed_worker_start, daemon=True).start()
+        logger.info("Application initialized with delayed Celery worker start")
+    else:
+        logger.info("Application initialized without embedded Celery worker")
+
+@app.route('/worker/start', methods=['POST'])
+def start_worker():
+    """API route to start a Celery worker"""
+    if app.config.get('CELERY_WORKER_RUNNING', False):
+        return jsonify({"status": "already_running", "message": "Celery worker is already running"})
+    
+    try:
+        start_celery_worker()
+        return jsonify({"status": "success", "message": "Celery worker started"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Failed to start Celery worker: {str(e)}"})
+
+@app.route('/worker/status', methods=['GET'])
+def worker_status():
+    """API route to check Celery worker status"""
+    is_running = app.config.get('CELERY_WORKER_RUNNING', False)
+    
+    # If we think it's running, verify by pinging
+    if is_running:
+        try:
+            from tasks import celery
+            ping_result = celery.control.ping(timeout=2.0)
+            is_responding = bool(ping_result)
+        except Exception:
+            is_responding = False
+    else:
+        is_responding = False
+    
+    return jsonify({
+        "running": is_running,
+        "responding": is_responding
+    })

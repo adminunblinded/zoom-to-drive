@@ -202,6 +202,22 @@ def index():
             first_recording = recordings[0]
             first_topic = first_recording.get('topic', 'Unknown')
             logger.info(f"Starting task with {len(recordings)} recordings, first recording topic: {first_topic}")
+            
+            # Check if Celery workers are available and running
+            from tasks import celery
+            try:
+                # Ping the workers to make sure they're alive
+                ping_result = celery.control.ping(timeout=5.0)
+                if not ping_result:
+                    logger.warning("No Celery workers responded to ping. Starting local processing instead.")
+                    # Use a fallback synchronous approach since workers aren't responding
+                    return process_recordings_synchronously(serialized_credentials, recordings)
+                else:
+                    logger.info(f"Celery workers online: {ping_result}")
+            except Exception as e:
+                logger.warning(f"Error checking Celery workers: {str(e)}. Starting local processing instead.")
+                # Use a fallback synchronous approach since workers aren't responding
+                return process_recordings_synchronously(serialized_credentials, recordings)
                 
             # Start the folder setup and processing pipeline
             task = setup_folders.delay(serialized_credentials, recordings)
@@ -232,6 +248,41 @@ def index():
         return jsonify({
             'status': 'error',
             'message': f"Error starting upload: {str(e)}"
+        })
+
+def process_recordings_synchronously(serialized_credentials, recordings):
+    """Process recordings synchronously when Celery workers are not available"""
+    logger.info(f"Starting synchronous processing of {len(recordings)} recordings")
+    
+    try:
+        # Import the required functions directly
+        from tasks import setup_folders_sync, share_folder_with_email
+        
+        # Create a response object to track progress
+        response = {
+            'status': 'processing',
+            'processed': 0,
+            'total': len(recordings),
+            'started_at': datetime.now().isoformat(),
+            'completed_folders': []
+        }
+        
+        # Process the folders and recordings
+        result = setup_folders_sync(serialized_credentials, recordings)
+        
+        # Update the response
+        response['status'] = 'completed'
+        response['result'] = result
+        response['completed_at'] = datetime.now().isoformat()
+        
+        logger.info(f"Completed synchronous processing: {result}")
+        return jsonify(response)
+        
+    except Exception as e:
+        logger.error(f"Error in synchronous processing: {str(e)}", exc_info=True)
+        return jsonify({
+            'status': 'error',
+            'message': f"Error in synchronous processing: {str(e)}"
         })
 
 @upload_blueprint.route('/upload_callback')
