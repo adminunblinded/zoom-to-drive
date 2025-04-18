@@ -78,12 +78,12 @@ patch_celery_entry_points()
 
 redis_url = 'redis://default:cZwwwfMhMjpiwoBIUoGCJrsrFBowGRrn@redis.railway.internal:6379'
 
-# Initialize Celery with explicit broker and no backend
+# Initialize Celery with explicit broker and explicitly disable backend
 celery = Celery('tasks')
 celery.conf.update(
     broker_url=redis_url,
-    # Explicitly disable result backend
-    result_backend=None,
+    # Explicitly disable result backend with the 'disabled' protocol
+    result_backend='disabled://',
     broker_connection_retry=True,
     broker_connection_retry_on_startup=True,
     broker_connection_timeout=30,
@@ -99,6 +99,28 @@ celery.conf.update(
     worker_hijack_root_logger=False
 )
 
+# Patch Celery's result backend handler to prevent errors when backend is accessed
+def patch_result_backend():
+    try:
+        from celery.app import base as celery_base
+        original_get_backend = celery_base.Celery._get_backend
+        
+        def patched_get_backend(self):
+            try:
+                return original_get_backend(self)
+            except (AttributeError, ImportError, ValueError) as e:
+                print(f"Backend initialization error: {e}. Using disabled backend.")
+                # Return a dummy backend that does nothing
+                from celery.backends.base import DisabledBackend
+                return DisabledBackend(app=self), 'disabled://'
+                
+        celery_base.Celery._get_backend = patched_get_backend
+    except Exception as e:
+        print(f"Failed to patch Celery backend: {e}")
+
+# Apply the backend patch
+patch_result_backend()
+
 redis_client = redis.from_url(redis_url)
 
 # Add a failsafe task wrapper that doesn't depend on the entry points patch
@@ -107,7 +129,20 @@ def create_failsafe_task():
     Creates a simpler task implementation that doesn't rely on complex Celery features
     to ensure at least basic functionality works even if the patch fails
     """
-    @celery.task(name='tasks.upload_safe', bind=True, max_retries=3)
+    # First create a completely standalone version that doesn't use delay() at all
+    def manual_upload(serialized_credentials, recordings):
+        """Direct function call that bypasses Celery completely for extreme cases"""
+        print("Using manual upload implementation (no Celery)")
+        try:
+            # Direct function call bypassing Celery entirely
+            uploadFiles(serialized_credentials, recordings)
+            return "Completed manual upload task"
+        except Exception as e:
+            print(f"Error in manual upload: {str(e)}")
+            raise
+    
+    # Then create a proper Celery task with robust error handling
+    @celery.task(name='tasks.upload_safe', bind=True, max_retries=3, ignore_result=True)
     def upload_safe(self, serialized_credentials, recordings):
         """Simplified version of uploadFiles that serves as a fallback"""
         print("Using failsafe upload task implementation")
@@ -118,13 +153,15 @@ def create_failsafe_task():
         except Exception as e:
             print(f"Error in failsafe task: {str(e)}")
             if self.request.retries < 3:
-                self.retry(countdown=60, exc=e)
+                retry_countdown = 60 * (2 ** self.request.retries)
+                self.retry(countdown=retry_countdown, exc=e)
             else:
                 raise
-    return upload_safe
+    
+    return upload_safe, manual_upload
 
 # Create the failsafe task
-upload_safe = create_failsafe_task()
+upload_safe, manual_upload = create_failsafe_task()
 
 @celery.task(bind=True, max_retries=3)
 def uploadFiles(self_or_serialized_credentials=None, recordings_or_self=None, recordings=None):

@@ -55,6 +55,8 @@ def retrieve_parameters():
 
 def use_failsafe_if_needed(credentials, recordings, batch=None):
     """Helper function to try the main task first and fallback to the failsafe if needed"""
+    target_recordings = batch if batch is not None else recordings
+    
     try:
         # Try the standard task first
         from tasks import uploadFiles
@@ -66,13 +68,35 @@ def use_failsafe_if_needed(credentials, recordings, batch=None):
         # If there's an EntryPoints error, try the failsafe implementation
         if "'EntryPoints' object has no attribute" in str(attr_err):
             print(f"EntryPoints error detected, using failsafe task implementation")
-            from tasks import upload_safe
-            if batch is not None:
-                return upload_safe.delay(credentials, batch)
-            else:
-                return upload_safe.delay(credentials, recordings)
+            try:
+                from tasks import upload_safe
+                if batch is not None:
+                    return upload_safe.delay(credentials, batch) 
+                else:
+                    return upload_safe.delay(credentials, recordings)
+            except Exception as e:
+                # If the failsafe task also fails, use the manual implementation
+                print(f"Failsafe task also failed: {str(e)}. Using manual implementation.")
+                from tasks import manual_upload
+                # This runs synchronously, so the HTTP request will wait
+                try:
+                    manual_upload(credentials, target_recordings)
+                    return "Using manual upload (sync)"
+                except Exception as manual_err:
+                    print(f"Even manual upload failed: {str(manual_err)}")
+                    raise
         else:
             # Re-raise other attribute errors
+            raise
+    except Exception as e:
+        # For any other exception, try the manual implementation
+        print(f"Unexpected error in task dispatch: {str(e)}. Trying manual upload.")
+        from tasks import manual_upload
+        try:
+            manual_upload(credentials, target_recordings)
+            return "Using manual upload due to unexpected error"
+        except Exception as manual_err:
+            print(f"Manual upload also failed: {str(manual_err)}")
             raise
 
 @upload_blueprint.route('/')
